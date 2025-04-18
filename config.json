@@ -1,0 +1,31 @@
+{
+  "port": 8443,
+  "ssl_enabled": true,
+  "cert_file": "server.crt",
+  "key_file": "server.key",
+  "default_upstream": "http://localhost:8080",
+  "default_jwt_secret": "default_global_secret_key",
+  "ip_allow_list": ["192.168.1.100", "10.0.0.5"],
+  "ip_deny_list": ["192.168.1.200"],
+  "trust_self_signed": false,
+  "virtual_hosts": {
+    "api.example.com": {
+      "upstream": "https://backend-api:8000",
+      "jwt_secret": "api_secret_key_12345",
+      "trust_self_signed": true
+    },
+    "admin.example.com": {
+      "upstream": "https://admin-backend:9000",
+      "jwt_secret": "admin_secret_key_67890",
+      "trust_self_signed": false
+    },
+    "public.example.com": {
+      "upstream": "http://public-service:5000",
+      "jwt_secret": ""
+    },
+    "legacy.example.com": {
+      "upstream": "https://legacy-service:4443",
+      "trust_self_signed": true
+    }
+  }
+}

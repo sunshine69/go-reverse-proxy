@@ -1,9 +1,8 @@
 package main
 
 import (
-	"crypto/ecdsa"
-	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/rsa"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
@@ -19,379 +18,524 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
-	"github.com/golang-jwt/jwt"
+	"github.com/golang-jwt/jwt/v5"
 )
 
-// Configuration structs
+// Config represents the server configuration
 type Config struct {
-	Port             int                    `json:"port"`
-	SSLEnabled       bool                   `json:"ssl_enabled"`
-	CertFile         string                 `json:"cert_file"`
-	KeyFile          string                 `json:"key_file"`
-	DefaultUpstream  string                 `json:"default_upstream"`
-	IPAllowList      []string               `json:"ip_allow_list"`
-	IPDenyList       []string               `json:"ip_deny_list"`
-	TrustSelfSigned  bool                   `json:"trust_self_signed"`
-	VirtualHosts     map[string]VirtualHost `json:"virtual_hosts"`
-	DefaultJWTSecret string                 `json:"default_jwt_secret"`
+	Port       int      `json:"port"`
+	DefaultSSL bool     `json:"default_ssl"`
+	DefaultCrt string   `json:"default_crt"`
+	DefaultKey string   `json:"default_key"`
+	AllowedIPs []string `json:"allowed_ips"`
+	DeniedIPs  []string `json:"denied_ips"`
+	VHosts     []VHost  `json:"vhosts"`
 }
 
-type VirtualHost struct {
-	Upstream        string `json:"upstream"`
-	JWTSecret       string `json:"jwt_secret"`
-	JWTCertFile     string `json:"jwt_cert_file"`               // For RS256
-	TrustSelfSigned *bool  `json:"trust_self_signed,omitempty"` // Per-vhost SSL trust setting
+// VHost represents a virtual host configuration
+type VHost struct {
+	Hostname     string `json:"hostname"`
+	UpstreamURL  string `json:"upstream_url"`
+	JWTSecret    string `json:"jwt_secret"`
+	SSLEnabled   bool   `json:"ssl_enabled"`
+	SSLCert      string `json:"ssl_cert"`
+	SSLKey       string `json:"ssl_key"`
+	InsecureTLS  bool   `json:"insecure_tls"`
+	JWTPublicKey string `json:"jwt_public_key"`
 }
 
-// JWTClaims defines the structure of our JWT claims
-type JWTClaims struct {
-	Username string `json:"username"`
-	Role     string `json:"role"`
-	jwt.StandardClaims
+// ProxyHandler contains the pre-configured proxy handler for a vhost
+type ProxyHandler struct {
+	vhost        VHost
+	proxy        *httputil.ReverseProxy
+	requiresAuth bool
+}
+
+var (
+	configFile     string
+	upstreamURL    string
+	port           int
+	sslEnabled     bool
+	sslCert        string
+	sslKey         string
+	insecureTLS    bool
+	jwtSecret      string
+	config         Config
+	vhostConfigs   map[string]VHost
+	proxyHandlers  map[string]*ProxyHandler
+	defaultHandler *ProxyHandler
+	handlerMutex   sync.RWMutex
+)
+
+func init() {
+	flag.StringVar(&configFile, "config", "config.json", "Path to configuration file")
+	flag.StringVar(&upstreamURL, "upstream", "", "Upstream server URL")
+	flag.IntVar(&port, "port", 8080, "Port to listen on")
+	flag.BoolVar(&sslEnabled, "ssl", false, "Enable SSL")
+	flag.StringVar(&sslCert, "cert", "", "SSL certificate file")
+	flag.StringVar(&sslKey, "key", "", "SSL key file")
+	flag.BoolVar(&insecureTLS, "insecure", false, "Skip verification of upstream certificate")
+	flag.StringVar(&jwtSecret, "jwt-secret", "", "JWT secret for token validation")
 }
 
 func main() {
-	// Parse command line flags
-	upstreamURL := flag.String("upstream", "", "Default upstream server URL")
-	port := flag.Int("port", 8080, "Port to listen on")
-	sslEnabled := flag.Bool("ssl", false, "Enable SSL")
-	certFile := flag.String("cert", "server.crt", "SSL certificate file")
-	keyFile := flag.String("key", "server.key", "SSL key file")
-	configFile := flag.String("config", "config.json", "Configuration file")
-	trustSelfSigned := flag.Bool("trust-self-signed", false, "Trust self-signed certificates on upstream")
-	generateCert := flag.Bool("generate-cert", false, "Generate self-signed certificate if not exists")
-	defaultJWTSecret := flag.String("jwt-secret", "", "Default JWT secret for authentication")
 	flag.Parse()
 
-	// Load configuration
-	config := loadConfig(*configFile)
+	// Load configuration file
+	loadConfig()
 
-	// Override config with command line flags if provided
-	if *upstreamURL != "" {
-		config.DefaultUpstream = *upstreamURL
-	}
-	if *port != 8080 {
-		config.Port = *port
-	}
-	if *sslEnabled {
-		config.SSLEnabled = true
-	}
-	if *certFile != "server.crt" {
-		config.CertFile = *certFile
-	}
-	if *keyFile != "server.key" {
-		config.KeyFile = *keyFile
-	}
-	if *trustSelfSigned {
-		config.TrustSelfSigned = true
-	}
-	if *defaultJWTSecret != "" {
-		config.DefaultJWTSecret = *defaultJWTSecret
-	}
+	// Initialize vhost map and pre-create proxy handlers
+	vhostConfigs = make(map[string]VHost)
+	proxyHandlers = make(map[string]*ProxyHandler)
 
-	// Check if SSL is enabled and certificates need to be generated
-	if config.SSLEnabled {
-		certExists := fileExists(config.CertFile)
-		keyExists := fileExists(config.KeyFile)
-
-		if (!certExists || !keyExists) && *generateCert {
-			// Generate self-signed certificate
-			err := GenerateSelfSignedCert(config.CertFile, config.KeyFile)
-			if err != nil {
-				log.Fatalf("Failed to generate self-signed certificate: %v", err)
-			}
-		} else if !certExists || !keyExists {
-			log.Fatalf("SSL certificate or key file not found. Use --generate-cert to generate them automatically.")
-		}
-	}
-
-	// Set up the default transport with global SSL settings
-	defaultTransport := &http.Transport{
-		TLSClientConfig: &tls.Config{
-			InsecureSkipVerify: config.TrustSelfSigned,
-		},
-	}
-
-	// Create default upstream target
-	defaultTargetURL, err := url.Parse(config.DefaultUpstream)
-	if err != nil {
-		log.Fatalf("Error parsing default upstream URL: %v", err)
-	}
-
-	// Create reverse proxy handler with default transport
-	proxy := httputil.NewSingleHostReverseProxy(defaultTargetURL)
-	proxy.Transport = defaultTransport
-
-	// Create maps for virtual host configuration
-	vhostProxies := make(map[string]*httputil.ReverseProxy)
-	vhostSecrets := make(map[string]string)
-	vhostAuthEnabled := make(map[string]bool)
-
-	for hostname, vhost := range config.VirtualHosts {
-		targetURL, err := url.Parse(vhost.Upstream)
+	// Create handlers for each vhost
+	for _, vhost := range config.VHosts {
+		vhostConfigs[vhost.Hostname] = vhost
+		handler, err := createProxyHandler(vhost)
 		if err != nil {
-			log.Printf("Error parsing upstream URL for %s: %v", hostname, err)
+			log.Printf("Error creating proxy handler for %s: %v", vhost.Hostname, err)
 			continue
 		}
 
-		// Create a custom transport for this vhost if it has specific SSL trust settings
-		vhostProxy := httputil.NewSingleHostReverseProxy(targetURL)
+		proxyHandlers[vhost.Hostname] = handler
 
-		// Check if this vhost has specific SSL trust settings
-		if vhost.TrustSelfSigned != nil {
-			// Create a custom transport with vhost-specific SSL settings
-			vhostTransport := &http.Transport{
-				TLSClientConfig: &tls.Config{
-					InsecureSkipVerify: *vhost.TrustSelfSigned,
-				},
-			}
-			vhostProxy.Transport = vhostTransport
-			log.Printf("Virtual host %s => upstream '%s' - SSL trust setting: %v", vhost.Upstream, hostname, *vhost.TrustSelfSigned)
-		} else {
-			// Use the default transport
-			vhostProxy.Transport = defaultTransport
-		}
-
-		vhostProxies[hostname] = vhostProxy
-		vhostSecrets[hostname] = vhost.JWTSecret
-
-		// Enable authentication only if JWT secret is not empty
-		vhostAuthEnabled[hostname] = vhost.JWTSecret != ""
-		if !vhostAuthEnabled[hostname] {
-			log.Printf("[WARN] Authentication disabled for virtual host %s (no JWT secret provided)", hostname)
+		// Set default handler if this is a wildcard host
+		if vhost.Hostname == "*" {
+			defaultHandler = handler
 		}
 	}
 
-	// Create HTTP server
+	// If no default handler exists, create one from command line args
+	if defaultHandler == nil && upstreamURL != "" {
+		defaultVhost := VHost{
+			Hostname:    "*",
+			UpstreamURL: upstreamURL,
+			JWTSecret:   jwtSecret,
+			SSLEnabled:  sslEnabled,
+			SSLCert:     sslCert,
+			SSLKey:      sslKey,
+			InsecureTLS: insecureTLS,
+		}
+
+		handler, err := createProxyHandler(defaultVhost)
+		if err != nil {
+			log.Fatalf("Error creating default proxy handler: %v", err)
+		}
+
+		defaultHandler = handler
+		vhostConfigs["*"] = defaultVhost
+		proxyHandlers["*"] = handler
+	}
+
+	// Create server
 	server := &http.Server{
-		Addr: fmt.Sprintf(":%d", config.Port),
-		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			// Log remote IP
-			ip, _, err := net.SplitHostPort(r.RemoteAddr)
-			if err != nil {
-				ip = r.RemoteAddr
-			}
-			log.Printf("Request from IP: %s to Host: %s", ip, r.Host)
-
-			// Check if IP is in deny list
-			for _, deniedIP := range config.IPDenyList {
-				if ip == deniedIP {
-					http.Error(w, "Access denied", http.StatusForbidden)
-					return
-				}
-			}
-
-			// Check if IP allow list is configured and not empty
-			if len(config.IPAllowList) > 0 {
-				allowed := false
-				for _, allowedIP := range config.IPAllowList {
-					if ip == allowedIP {
-						allowed = true
-						break
-					}
-				}
-				// Check if localhost (special case - always allowed)
-				if ip == "127.0.0.1" || ip == "::1" || ip == "localhost" {
-					allowed = true
-				}
-				if !allowed {
-					http.Error(w, "IP not in allow list", http.StatusForbidden)
-					return
-				}
-			}
-
-			// Check if request is from localhost
-			isLocalhost := ip == "127.0.0.1" || ip == "::1" || ip == "localhost"
-
-			// Get hostname for virtual host routing
-			hostname := r.Host
-			if strings.Contains(hostname, ":") {
-				hostname, _, _ = net.SplitHostPort(hostname)
-			}
-
-			// Select the appropriate proxy and JWT secret based on the hostname
-			currentProxy := proxy
-			jwtSecret := config.DefaultJWTSecret // Default secret
-			authEnabled := config.DefaultJWTSecret != ""
-
-			if vhostProxy, exists := vhostProxies[hostname]; exists {
-				currentProxy = vhostProxy
-				jwtSecret = vhostSecrets[hostname]
-				authEnabled = vhostAuthEnabled[hostname]
-			}
-
-			// Skip authentication for localhost or if auth is disabled for this vhost
-			if !isLocalhost && authEnabled {
-				// First try to extract token from query parameters
-				tokenString := r.URL.Query().Get("access_token")
-
-				// If no token in query, check Authorization header
-				if tokenString == "" {
-					authHeader := r.Header.Get("Authorization")
-					if authHeader != "" && strings.HasPrefix(authHeader, "Bearer ") {
-						tokenString = strings.TrimPrefix(authHeader, "Bearer ")
-					}
-				}
-
-				// If still no token found, return unauthorized
-				if tokenString == "" {
-					http.Error(w, "Authentication token required", http.StatusUnauthorized)
-					return
-				}
-
-				// Parse and validate JWT token
-				token, err := jwt.ParseWithClaims(tokenString, &JWTClaims{}, func(token *jwt.Token) (interface{}, error) {
-					// Validate the algorithm
-					if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
-						return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
-					}
-					return []byte(jwtSecret), nil
-				})
-
-				if err != nil || !token.Valid {
-					http.Error(w, "Invalid token", http.StatusUnauthorized)
-					return
-				}
-
-				// Access token claims if needed
-				// if claims, ok := token.Claims.(*JWTClaims); ok {
-				//     log.Printf("User: %s, Role: %s", claims.Username, claims.Role)
-				// }
-			}
-
-			// Remove the access_token parameter from the URL if present
-			if r.URL.Query().Get("access_token") != "" {
-				q := r.URL.Query()
-				q.Del("access_token")
-				r.URL.RawQuery = q.Encode()
-			}
-
-			// Serve the request through the proxy
-			currentProxy.ServeHTTP(w, r)
-		}),
+		Addr:    fmt.Sprintf(":%d", config.Port),
+		Handler: http.HandlerFunc(routeRequest),
 	}
 
-	// Start the server
-	if config.SSLEnabled {
-		log.Printf("Starting HTTPS server on port %d", config.Port)
-		log.Fatal(server.ListenAndServeTLS(config.CertFile, config.KeyFile))
+	// Configure TLS
+	tlsConfig := configureTLS()
+	if tlsConfig != nil {
+		server.TLSConfig = tlsConfig
+		log.Printf("Starting reverse proxy with SSL on port %d", config.Port)
+		log.Fatal(server.ListenAndServeTLS("", ""))
 	} else {
-		log.Printf("Starting HTTP server on port %d", config.Port)
+		log.Printf("Starting reverse proxy on port %d", config.Port)
 		log.Fatal(server.ListenAndServe())
 	}
 }
 
-func loadConfig(configFile string) Config {
-	// Default configuration
-	config := Config{
-		Port:             8080,
-		SSLEnabled:       false,
-		CertFile:         "server.crt",
-		KeyFile:          "server.key",
-		DefaultUpstream:  "http://localhost:8081",
-		IPAllowList:      []string{},
-		IPDenyList:       []string{},
-		TrustSelfSigned:  false,
-		VirtualHosts:     make(map[string]VirtualHost),
-		DefaultJWTSecret: "",
-	}
+func loadConfig() {
+	// Set defaults from flags
+	config.Port = port
+	config.DefaultSSL = sslEnabled
+	config.DefaultCrt = sslCert
+	config.DefaultKey = sslKey
 
-	// Try to load from file
-	if _, err := os.Stat(configFile); err == nil {
-		// Read the file
-		data, err := os.ReadFile(configFile)
-		if err == nil {
-			// Parse JSON
-			err = json.Unmarshal(data, &config)
-			if err != nil {
-				log.Printf("Error parsing config file: %v", err)
-			} else {
-				log.Printf("Loaded configuration from %s", configFile)
-			}
-		} else {
-			log.Printf("Error reading config file: %v", err)
+	// Try to load config file
+	data, err := os.ReadFile(configFile)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			log.Printf("Warning: Could not read config file: %v", err)
 		}
-	} else {
-		log.Printf("Config file %s not found, using defaults", configFile)
+		// If no config file, create a default vhost using command line flags
+		if upstreamURL != "" {
+			config.VHosts = []VHost{
+				{
+					Hostname:    "*",
+					UpstreamURL: upstreamURL,
+					JWTSecret:   jwtSecret,
+					SSLEnabled:  sslEnabled,
+					SSLCert:     sslCert,
+					SSLKey:      sslKey,
+					InsecureTLS: insecureTLS,
+				},
+			}
+		}
+		return
 	}
 
-	return config
+	// Parse config file
+	if err := json.Unmarshal(data, &config); err != nil {
+		log.Fatalf("Failed to parse config file: %v", err)
+	}
+
+	// Override with flags if specified
+	if port != 8080 {
+		config.Port = port
+	}
+	if sslEnabled {
+		config.DefaultSSL = true
+		if sslCert != "" {
+			config.DefaultCrt = sslCert
+		}
+		if sslKey != "" {
+			config.DefaultKey = sslKey
+		}
+	}
 }
 
-// GenerateSelfSignedCert creates a self-signed certificate and saves it to the specified files
-func GenerateSelfSignedCert(certFile, keyFile string) error {
-	// Create a new private key
-	privateKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+// createProxyHandler creates a reverse proxy handler for a vhost
+func createProxyHandler(vhost VHost) (*ProxyHandler, error) {
+	targetURL, err := url.Parse(vhost.UpstreamURL)
 	if err != nil {
-		return fmt.Errorf("failed to generate private key: %v", err)
+		return nil, fmt.Errorf("invalid upstream URL: %v", err)
 	}
 
-	// Create a certificate template
-	serialNumberLimit := new(big.Int).Lsh(big.NewInt(1), 128)
-	serialNumber, err := rand.Int(rand.Reader, serialNumberLimit)
-	if err != nil {
-		return fmt.Errorf("failed to generate serial number: %v", err)
+	// Create a new reverse proxy
+	proxy := httputil.NewSingleHostReverseProxy(targetURL)
+
+	// Configure transport for upstream connection
+	transport := &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		DialContext: (&net.Dialer{
+			Timeout:   30 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          100,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
 	}
 
+	// Handle insecure TLS (self-signed certificate) for upstream
+	if vhost.InsecureTLS {
+		transport.TLSClientConfig = &tls.Config{
+			InsecureSkipVerify: true,
+		}
+	}
+
+	proxy.Transport = transport
+
+	// Set up the director function
+	originalDirector := proxy.Director
+	proxy.Director = func(req *http.Request) {
+		originalDirector(req)
+		req.Header.Set("X-Forwarded-Host", req.Host)
+		req.Header.Set("X-Real-IP", getIPFromRequest(req))
+		req.Host = targetURL.Host
+	}
+
+	// Configure error handler
+	proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
+		log.Printf("Proxy error: %v", err)
+		http.Error(w, "Proxy Error", http.StatusBadGateway)
+	}
+
+	// Create handler
+	handler := &ProxyHandler{
+		vhost:        vhost,
+		proxy:        proxy,
+		requiresAuth: vhost.JWTSecret != "",
+	}
+
+	return handler, nil
+}
+
+// configureTLS sets up the TLS configuration with all certificates
+func configureTLS() *tls.Config {
+	if !config.DefaultSSL {
+		return nil
+	}
+
+	certs := []tls.Certificate{}
+
+	// Add default certificate
+	if config.DefaultCrt != "" && config.DefaultKey != "" {
+		defaultCert, err := tls.LoadX509KeyPair(config.DefaultCrt, config.DefaultKey)
+		if err != nil {
+			log.Printf("Failed to load default SSL certificate: %v", err)
+		} else {
+			certs = append(certs, defaultCert)
+		}
+	}
+
+	// Add vhost certificates
+	for _, vhost := range config.VHosts {
+		log.Printf("VHOST %s => '%s - SSLEnabled: %v\n", vhost.Hostname, vhost.UpstreamURL, vhost.SSLEnabled)
+		if vhost.JWTSecret == "" {
+			log.Printf("[WARN] VHOST %s JWTSecret is empty, disabling authentication\n", vhost.Hostname)
+		}
+		if vhost.SSLEnabled && vhost.SSLCert != "" && vhost.SSLKey != "" {
+			cert, err := tls.LoadX509KeyPair(vhost.SSLCert, vhost.SSLKey)
+			if err != nil {
+				log.Printf("Failed to load SSL certificate for %s: %v", vhost.Hostname, err)
+				continue
+			}
+			certs = append(certs, cert)
+		}
+	}
+
+	// Generate self-signed certificate if no certificates are available
+	if len(certs) == 0 {
+		log.Println("No certificates found or loaded, generating self-signed certificate")
+		cert, err := generateSelfSignedCert()
+		if err != nil {
+			log.Fatalf("Failed to generate self-signed certificate: %v", err)
+		}
+		certs = append(certs, cert)
+	}
+
+	return &tls.Config{
+		Certificates: certs,
+		GetCertificate: func(info *tls.ClientHelloInfo) (*tls.Certificate, error) {
+			// Find certificate for the requested server name
+			if info.ServerName != "" {
+				// Try exact match
+				if vhost, ok := vhostConfigs[info.ServerName]; ok && vhost.SSLEnabled {
+					cert, err := tls.LoadX509KeyPair(vhost.SSLCert, vhost.SSLKey)
+					if err == nil {
+						return &cert, nil
+					}
+				}
+			}
+			// Return the first certificate as default
+			if len(certs) > 0 {
+				return &certs[0], nil
+			}
+			return nil, fmt.Errorf("no certificate available for %s", info.ServerName)
+		},
+	}
+}
+
+// generateSelfSignedCert creates a new self-signed certificate
+func generateSelfSignedCert() (tls.Certificate, error) {
+	// Generate private key
+	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+
+	// Create certificate template
+	serialNumber, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+
+	now := time.Now()
 	template := x509.Certificate{
 		SerialNumber: serialNumber,
 		Subject: pkix.Name{
-			Organization: []string{"Reverse Proxy Self Signed"},
+			Organization: []string{"Reverse Proxy Self Signed Certificate"},
 			CommonName:   "localhost",
 		},
-		NotBefore:             time.Now(),
-		NotAfter:              time.Now().Add(365 * 24 * time.Hour), // Valid for 1 year
-		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
+		NotBefore:             now,
+		NotAfter:              now.Add(365 * 24 * time.Hour), // 1 year
+		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
 		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 		BasicConstraintsValid: true,
-		IPAddresses:           []net.IP{net.ParseIP("127.0.0.1")},
+		IsCA:                  true,
 		DNSNames:              []string{"localhost"},
+		IPAddresses:           []net.IP{net.ParseIP("127.0.0.1"), net.ParseIP("::1")},
 	}
 
-	// Create the certificate
+	// Create certificate
 	derBytes, err := x509.CreateCertificate(rand.Reader, &template, &template, &privateKey.PublicKey, privateKey)
 	if err != nil {
-		return fmt.Errorf("failed to create certificate: %v", err)
+		return tls.Certificate{}, err
 	}
 
-	// Write the certificate to file
-	certOut, err := os.Create(certFile)
-	if err != nil {
-		return fmt.Errorf("failed to open %s for writing: %v", certFile, err)
-	}
-	defer certOut.Close()
+	// Encode certificate and private key to PEM
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: derBytes})
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(privateKey)})
 
-	err = pem.Encode(certOut, &pem.Block{Type: "CERTIFICATE", Bytes: derBytes})
-	if err != nil {
-		return fmt.Errorf("failed to write certificate to file: %v", err)
-	}
-	log.Printf("Certificate written to %s", certFile)
-
-	// Write the private key to file
-	keyOut, err := os.OpenFile(keyFile, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
-	if err != nil {
-		return fmt.Errorf("failed to open %s for writing: %v", keyFile, err)
-	}
-	defer keyOut.Close()
-
-	privBytes, err := x509.MarshalECPrivateKey(privateKey)
-	if err != nil {
-		return fmt.Errorf("failed to marshal private key: %v", err)
+	// Save the certificate and key to files if needed
+	if config.DefaultCrt != "" && config.DefaultKey != "" {
+		if err := os.WriteFile(config.DefaultCrt, certPEM, 0644); err != nil {
+			log.Printf("Failed to write certificate to file: %v", err)
+		}
+		if err := os.WriteFile(config.DefaultKey, keyPEM, 0600); err != nil {
+			log.Printf("Failed to write private key to file: %v", err)
+		}
 	}
 
-	err = pem.Encode(keyOut, &pem.Block{Type: "EC PRIVATE KEY", Bytes: privBytes})
+	// Parse the certificate
+	cert, err := tls.X509KeyPair(certPEM, keyPEM)
 	if err != nil {
-		return fmt.Errorf("failed to write private key to file: %v", err)
+		return tls.Certificate{}, err
 	}
-	log.Printf("Private key written to %s", keyFile)
+
+	return cert, nil
+}
+
+// routeRequest is the main request handler that routes requests to the appropriate vhost handler
+func routeRequest(w http.ResponseWriter, r *http.Request) {
+	// Get remote IP directly from the connection
+	remoteIP := getIPFromRequest(r)
+	log.Printf("Request from IP: %s to %s%s", remoteIP, r.Host, r.URL.Path)
+
+	// Check if IP is in denied list
+	if isIPDenied(remoteIP) {
+		http.Error(w, "Access denied", http.StatusForbidden)
+		return
+	}
+
+	// Check if IP is not in allowed list (when allowed list is not empty)
+	if !isIPAllowed(remoteIP) {
+		http.Error(w, "Access denied", http.StatusForbidden)
+		return
+	}
+
+	// Get the appropriate handler for this host
+	handlerMutex.RLock()
+	handler := getProxyHandler(r.Host)
+	handlerMutex.RUnlock()
+
+	if handler == nil {
+		http.Error(w, "No handler configured for this host", http.StatusNotFound)
+		return
+	}
+
+	// Skip auth if request is from localhost or the vhost has no JWT secret
+	isLocalhost := isLocalRequest(remoteIP)
+	if handler.requiresAuth && !isLocalhost {
+		// Validate JWT token
+		authorized, err := validateJWT(r, handler.vhost.JWTSecret)
+		if err != nil || !authorized {
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			if err != nil {
+				log.Printf("JWT validation error: %v", err)
+			}
+			return
+		}
+	}
+
+	// Forward the request to the upstream server
+	handler.proxy.ServeHTTP(w, r)
+}
+
+// getProxyHandler returns the appropriate proxy handler for the given hostname
+func getProxyHandler(hostname string) *ProxyHandler {
+	// Try exact match
+	if handler, ok := proxyHandlers[hostname]; ok {
+		return handler
+	}
+
+	// Try wildcard match
+	if defaultHandler != nil {
+		return defaultHandler
+	}
 
 	return nil
 }
 
-// Helper function to check if a file exists
-func fileExists(filename string) bool {
-	_, err := os.Stat(filename)
-	return err == nil
+// validateJWT validates the JWT token from the request
+func validateJWT(r *http.Request, secret string) (bool, error) {
+	var tokenString string
+
+	// Check Authorization header
+	authHeader := r.Header.Get("Authorization")
+	if authHeader != "" && strings.HasPrefix(authHeader, "Bearer ") {
+		tokenString = strings.TrimPrefix(authHeader, "Bearer ")
+	}
+
+	// If not in header, check URL parameter
+	if tokenString == "" {
+		tokenString = r.URL.Query().Get("access_token")
+	}
+
+	if tokenString == "" {
+		return false, fmt.Errorf("no token provided")
+	}
+
+	// Parse and validate token
+	token, err := jwt.Parse(tokenString, func(token *jwt.Token) (interface{}, error) {
+		// Validate algorithm
+		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
+			return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
+		}
+		return []byte(secret), nil
+	})
+
+	if err != nil {
+		return false, err
+	}
+
+	return token.Valid, nil
+}
+
+// getIPFromRequest gets the IP address from the request safely
+func getIPFromRequest(r *http.Request) string {
+	// Get IP from RemoteAddr
+	ip, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		// If SplitHostPort fails, use RemoteAddr as is
+		return r.RemoteAddr
+	}
+	return ip
+}
+
+// isLocalRequest checks if the request is coming from localhost
+func isLocalRequest(ip string) bool {
+	return ip == "127.0.0.1" || ip == "::1" || ip == "localhost"
+}
+
+// isIPDenied checks if the IP is in the denied list
+func isIPDenied(ip string) bool {
+	for _, deniedIP := range config.DeniedIPs {
+		if matchIP(ip, deniedIP) {
+			return true
+		}
+	}
+	return false
+}
+
+// isIPAllowed checks if the IP is in the allowed list
+func isIPAllowed(ip string) bool {
+	// If no allowed IPs are specified, allow all
+	if len(config.AllowedIPs) == 0 {
+		return true
+	}
+
+	for _, allowedIP := range config.AllowedIPs {
+		if matchIP(ip, allowedIP) {
+			return true
+		}
+	}
+	return false
+}
+
+// matchIP checks if an IP matches a pattern (exact match or CIDR)
+func matchIP(ip, pattern string) bool {
+	// Exact match
+	if ip == pattern {
+		return true
+	}
+
+	// CIDR match
+	_, ipNet, err := net.ParseCIDR(pattern)
+	if err != nil {
+		return false
+	}
+
+	ipParsed := net.ParseIP(ip)
+	if ipParsed == nil {
+		return false
+	}
+
+	return ipNet.Contains(ipParsed)
 }

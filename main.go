@@ -398,7 +398,7 @@ func routeRequest(w http.ResponseWriter, r *http.Request) {
 	isLocalhost := isLocalRequest(remoteIP)
 	if handler.requiresAuth && !isLocalhost {
 		// Validate JWT token
-		authorized, err := validateJWT(r, handler.vhost.JWTSecret)
+		authorized, err := validateJWT(r, handler)
 		if err != nil || !authorized {
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			if err != nil {
@@ -428,7 +428,7 @@ func getProxyHandler(hostname string) *ProxyHandler {
 }
 
 // validateJWT validates the JWT token from the request
-func validateJWT(r *http.Request, secret string) (bool, error) {
+func validateJWT(r *http.Request, handler *ProxyHandler) (bool, error) {
 	var tokenString string
 
 	// Check Authorization header
@@ -449,10 +449,17 @@ func validateJWT(r *http.Request, secret string) (bool, error) {
 	// Parse and validate token
 	token, err := jwt.Parse(tokenString, func(token *jwt.Token) (interface{}, error) {
 		// Validate algorithm
-		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
-			return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
+		if handler.vhost.JWTPublicKey == "" {
+			if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
+				return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
+			}
+			return []byte(handler.vhost.JWTSecret), nil
+		} else { // RS256
+			if _, ok := token.Method.(*jwt.SigningMethodRSA); !ok {
+				return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
+			}
+			return handler.vhost.JWTPublicKey, nil
 		}
-		return []byte(secret), nil
 	})
 
 	if err != nil {

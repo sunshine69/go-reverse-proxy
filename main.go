@@ -84,6 +84,13 @@ func init() {
 func main() {
 	flag.Parse()
 
+	if jwtSecret == "" {
+		jwtSecret = os.Getenv("JWT_SECRET")
+		if jwtSecret != "" {
+			log.Println("Loaded jwtSecret from env var JWT_SECRET")
+		}
+	}
+
 	// Load configuration file
 	loadConfig()
 
@@ -93,6 +100,7 @@ func main() {
 
 	// Create handlers for each vhost
 	for _, vhost := range config.VHosts {
+		log.Println("Creating handler for vhost " + vhost.Hostname)
 		vhostConfigs[vhost.Hostname] = vhost
 		handler, err := createProxyHandler(vhost)
 		if err != nil {
@@ -107,29 +115,6 @@ func main() {
 			defaultHandler = handler
 		}
 	}
-
-	// If no default handler exists, create one from command line args
-	if defaultHandler == nil && upstreamURL != "" {
-		defaultVhost := VHost{
-			Hostname:    "*",
-			UpstreamURL: upstreamURL,
-			JWTSecret:   jwtSecret,
-			SSLEnabled:  sslEnabled,
-			SSLCert:     sslCert,
-			SSLKey:      sslKey,
-			InsecureTLS: insecureTLS,
-		}
-
-		handler, err := createProxyHandler(defaultVhost)
-		if err != nil {
-			log.Fatalf("Error creating default proxy handler: %v", err)
-		}
-
-		defaultHandler = handler
-		vhostConfigs["*"] = defaultVhost
-		proxyHandlers["*"] = handler
-	}
-
 	// Create server
 	server := &http.Server{
 		Addr:    fmt.Sprintf(":%d", config.Port),
@@ -252,7 +237,6 @@ func createProxyHandler(vhost VHost) (*ProxyHandler, error) {
 		proxy:        proxy,
 		requiresAuth: vhost.JWTSecret != "",
 	}
-
 	return handler, nil
 }
 
@@ -498,6 +482,7 @@ func isLocalRequest(ip string) bool {
 func isIPDenied(ip string) bool {
 	for _, deniedIP := range config.DeniedIPs {
 		if matchIP(ip, deniedIP) {
+			log.Println("Denied IP " + deniedIP)
 			return true
 		}
 	}
@@ -508,11 +493,13 @@ func isIPDenied(ip string) bool {
 func isIPAllowed(ip string) bool {
 	// If no allowed IPs are specified, allow all
 	if len(config.AllowedIPs) == 0 {
+		log.Println("AllowedIPs not set allow all IPs")
 		return true
 	}
 
 	for _, allowedIP := range config.AllowedIPs {
 		if matchIP(ip, allowedIP) {
+			log.Println("AllowedIP IP " + allowedIP)
 			return true
 		}
 	}

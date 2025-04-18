@@ -37,14 +37,15 @@ type Config struct {
 
 // VHost represents a virtual host configuration
 type VHost struct {
-	Hostname     string `json:"hostname"`
-	UpstreamURL  string `json:"upstream_url"`
-	JWTSecret    string `json:"jwt_secret"`
-	SSLEnabled   bool   `json:"ssl_enabled"`
-	SSLCert      string `json:"ssl_cert"`
-	SSLKey       string `json:"ssl_key"`
-	InsecureTLS  bool   `json:"insecure_tls"`
-	JWTPublicKey string `json:"jwt_public_key"`
+	Hostname       string            `json:"hostname"`
+	UpstreamURL    string            `json:"upstream_url"`
+	JWTSecret      string            `json:"jwt_secret"`
+	SSLEnabled     bool              `json:"ssl_enabled"`
+	SSLCert        string            `json:"ssl_cert"`
+	SSLKey         string            `json:"ssl_key"`
+	InsecureTLS    bool              `json:"insecure_tls"`
+	JWTPublicKey   string            `json:"jwt_public_key"`
+	CustomeHeaders map[string]string `json:"custom_headers"`
 }
 
 // ProxyHandler contains the pre-configured proxy handler for a vhost
@@ -223,6 +224,10 @@ func createProxyHandler(vhost VHost) (*ProxyHandler, error) {
 		req.Header.Set("X-Forwarded-Host", req.Host)
 		req.Header.Set("X-Real-IP", getIPFromRequest(req))
 		req.Host = targetURL.Host
+		// Add custom headers
+		for kheader, vheader := range vhost.CustomeHeaders {
+			req.Header.Add(kheader, vheader)
+		}
 	}
 
 	// Configure error handler
@@ -407,7 +412,6 @@ func routeRequest(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-
 	// Forward the request to the upstream server
 	handler.proxy.ServeHTTP(w, r)
 }

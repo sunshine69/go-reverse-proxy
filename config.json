@@ -13,7 +13,10 @@
       "ssl_enabled": true,
       "ssl_cert": "api.example.com.crt",
       "ssl_key": "api.example.com.key",
-      "insecure_tls": true
+      "insecure_tls": true,
+      "custom_headers": {
+        "Authorization": "Bearer XXXX"
+      }
     },
     {
       "hostname": "public.example.com",

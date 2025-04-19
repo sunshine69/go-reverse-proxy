@@ -1,31 +1,30 @@
 {
-  "port": 8443,
-  "default_ssl": true,
+  "port": 21434,
+  "default_ssl": false,
   "default_crt": "server.crt",
   "default_key": "server.key",
-  "allowed_ips": ["192.168.1.0/24", "10.0.0.1"],
-  "denied_ips": ["1.2.3.4"],
+  "allowed_ips": [],
+  "denied_ips": [],
   "vhosts": [
     {
-      "hostname": "api.example.com",
-      "upstream_url": "https://internal-api.example.com",
-      "jwt_secret": "your-jwt-secret-here",
-      "ssl_enabled": true,
-      "ssl_cert": "api.example.com.crt",
-      "ssl_key": "api.example.com.key",
+      "hostname": "localhost",
+      "upstream_url": "http://localhost:11434",
+      "jwt_secret": "",
+      "ssl_enabled": false,
       "insecure_tls": true,
       "custom_headers": {
-        "Authorization": "Bearer XXXX"
+        "Authorization": "Bearer <JWT_TOKEN>"
       }
     },
     {
-      "hostname": "public.example.com",
-      "upstream_url": "http://internal-public.example.com",
+      "hostname": "127.0.0.1",
+      "upstream_url": "http://localhost:11434",
       "jwt_secret": "",
-      "ssl_enabled": true,
-      "ssl_cert": "public.example.com.crt",
-      "ssl_key": "public.example.com.key",
-      "insecure_tls": false
+      "ssl_enabled": false,
+      "insecure_tls": true,
+      "custom_headers": {
+        "Authorization": "Bearer <JWT_TOKEN>"
+      }
     }
   ]
 }

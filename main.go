@@ -375,27 +375,32 @@ func generateSelfSignedCert() (tls.Certificate, error) {
 func routeRequest(w http.ResponseWriter, r *http.Request) {
 	// Get remote IP directly from the connection
 	remoteIP := getIPFromRequest(r)
-	log.Printf("Request from IP: %s to %s%s", remoteIP, r.Host, r.URL.Path)
+	log.Printf("Request from IP: %s to vhost '%s' path '%s'", remoteIP, r.Host, r.URL.Path)
 
 	// Check if IP is in denied list
 	if isIPDenied(remoteIP) {
+		log.Printf("Access denied from IP: %s", remoteIP)
 		http.Error(w, "Access denied", http.StatusForbidden)
 		return
 	}
 
 	// Check if IP is not in allowed list (when allowed list is not empty)
 	if !isIPAllowed(remoteIP) {
+		log.Printf("Access denied from IP: %s", remoteIP)
 		http.Error(w, "Access denied", http.StatusForbidden)
 		return
 	}
 
 	// Get the appropriate handler for this host
 	handlerMutex.RLock()
-	handler := getProxyHandler(r.Host)
+	_host, _, _ := net.SplitHostPort(r.Host)
+	handler := getProxyHandler(_host)
 	handlerMutex.RUnlock()
 
 	if handler == nil {
-		http.Error(w, "No handler configured for this host", http.StatusNotFound)
+		msg := fmt.Sprintf("No handler configured for this host '%s'", _host)
+		log.Println(msg)
+		http.Error(w, msg, http.StatusNotFound)
 		return
 	}
 
@@ -413,6 +418,7 @@ func routeRequest(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	// Forward the request to the upstream server
+	// log.Printf("Send request to upstream %v\n", r)
 	handler.proxy.ServeHTTP(w, r)
 }
 
@@ -504,7 +510,7 @@ func isIPDenied(ip string) bool {
 func isIPAllowed(ip string) bool {
 	// If no allowed IPs are specified, allow all
 	if len(config.AllowedIPs) == 0 {
-		log.Println("AllowedIPs not set allow all IPs")
+		log.Println("AllowedIPs not set thus allow all IPs")
 		return true
 	}
 

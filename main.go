@@ -69,6 +69,7 @@ var (
 	proxyHandlers  map[string]*ProxyHandler
 	defaultHandler *ProxyHandler
 	handlerMutex   sync.RWMutex
+	DEBUG          bool
 )
 
 func init() {
@@ -80,10 +81,15 @@ func init() {
 	flag.StringVar(&sslKey, "key", "", "SSL key file")
 	flag.BoolVar(&insecureTLS, "insecure", false, "Skip verification of upstream certificate")
 	flag.StringVar(&jwtSecret, "jwt-secret", "", "JWT secret for token validation")
+	flag.BoolVar(&DEBUG, "debug", false, "Enable debug mode")
 }
 
 func main() {
 	flag.Parse()
+
+	if DEBUG {
+		log.Println("Debug mode enabled")
+	}
 
 	if jwtSecret == "" {
 		jwtSecret = os.Getenv("JWT_SECRET")
@@ -102,6 +108,9 @@ func main() {
 	// Create handlers for each vhost
 	for _, vhost := range config.VHosts {
 		log.Println("Creating handler for vhost " + vhost.Hostname)
+		if DEBUG {
+			log.Printf("VHost config: %+v", vhost)
+		}
 		vhostConfigs[vhost.Hostname] = vhost
 		handler, err := createProxyHandler(vhost)
 		if err != nil {
@@ -168,6 +177,9 @@ func loadConfig() {
 	if err := json.Unmarshal(data, &config); err != nil {
 		log.Fatalf("Failed to parse config file: %v", err)
 	}
+	if DEBUG {
+		log.Printf("Config loaded: %+v", config)
+	}
 
 	// Override with flags if specified
 	if port != 8080 {
@@ -213,6 +225,9 @@ func createProxyHandler(vhost VHost) (*ProxyHandler, error) {
 		transport.TLSClientConfig = &tls.Config{
 			InsecureSkipVerify: true,
 		}
+		if DEBUG {
+			log.Println("Insecure TLS enabled for upstream connection")
+		}
 	}
 
 	proxy.Transport = transport
@@ -227,6 +242,9 @@ func createProxyHandler(vhost VHost) (*ProxyHandler, error) {
 		// Add custom headers
 		for kheader, vheader := range vhost.CustomeHeaders {
 			req.Header.Add(kheader, vheader)
+			if DEBUG {
+				log.Printf("Adding custom header %s: %s", kheader, vheader)
+			}
 		}
 	}
 
@@ -242,12 +260,18 @@ func createProxyHandler(vhost VHost) (*ProxyHandler, error) {
 		proxy:        proxy,
 		requiresAuth: vhost.JWTSecret != "",
 	}
+	if DEBUG {
+		log.Printf("Proxy handler created for %s", vhost.Hostname)
+	}
 	return handler, nil
 }
 
 // configureTLS sets up the TLS configuration with all certificates
 func configureTLS() *tls.Config {
 	if !config.DefaultSSL {
+		if DEBUG {
+			log.Println("SSL not enabled")
+		}
 		return nil
 	}
 
@@ -260,6 +284,9 @@ func configureTLS() *tls.Config {
 			log.Printf("Failed to load default SSL certificate: %v", err)
 		} else {
 			certs = append(certs, defaultCert)
+			if DEBUG {
+				log.Println("Default SSL certificate loaded")
+			}
 		}
 	}
 
@@ -276,6 +303,9 @@ func configureTLS() *tls.Config {
 				continue
 			}
 			certs = append(certs, cert)
+			if DEBUG {
+				log.Printf("SSL certificate loaded for %s", vhost.Hostname)
+			}
 		}
 	}
 
@@ -287,6 +317,9 @@ func configureTLS() *tls.Config {
 			log.Fatalf("Failed to generate self-signed certificate: %v", err)
 		}
 		certs = append(certs, cert)
+		if DEBUG {
+			log.Println("Self-signed certificate generated")
+		}
 	}
 
 	return &tls.Config{
@@ -298,12 +331,18 @@ func configureTLS() *tls.Config {
 				if vhost, ok := vhostConfigs[info.ServerName]; ok && vhost.SSLEnabled {
 					cert, err := tls.LoadX509KeyPair(vhost.SSLCert, vhost.SSLKey)
 					if err == nil {
+						if DEBUG {
+							log.Printf("Serving certificate for %s", info.ServerName)
+						}
 						return &cert, nil
 					}
 				}
 			}
 			// Return the first certificate as default
 			if len(certs) > 0 {
+				if DEBUG {
+					log.Println("Serving default certificate")
+				}
 				return &certs[0], nil
 			}
 			return nil, fmt.Errorf("no certificate available for %s", info.ServerName)
@@ -360,6 +399,9 @@ func generateSelfSignedCert() (tls.Certificate, error) {
 		if err := os.WriteFile(config.DefaultKey, keyPEM, 0600); err != nil {
 			log.Printf("Failed to write private key to file: %v", err)
 		}
+		if DEBUG {
+			log.Println("Self-signed certificate and key saved to file")
+		}
 	}
 
 	// Parse the certificate
@@ -376,6 +418,9 @@ func routeRequest(w http.ResponseWriter, r *http.Request) {
 	// Get remote IP directly from the connection
 	remoteIP := getIPFromRequest(r)
 	log.Printf("Request from IP: %s to vhost '%s' path '%s'", remoteIP, r.Host, r.URL.Path)
+	if DEBUG {
+		log.Printf("Request details: %+v", r)
+	}
 
 	// Check if IP is in denied list
 	if isIPDenied(remoteIP) {
@@ -415,6 +460,13 @@ func routeRequest(w http.ResponseWriter, r *http.Request) {
 				log.Printf("JWT validation error: %v", err)
 			}
 			return
+		}
+		if DEBUG {
+			log.Println("JWT token validated successfully")
+		}
+	} else {
+		if DEBUG {
+			log.Println("Skipping JWT validation")
 		}
 	}
 	// Forward the request to the upstream server
@@ -475,7 +527,9 @@ func validateJWT(r *http.Request, handler *ProxyHandler) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-
+	if DEBUG {
+		log.Printf("JWT claims: %+v", token.Claims)
+	}
 	return token.Valid, nil
 }
 

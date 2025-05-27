@@ -1,0 +1,13 @@
+check-mode: letter+word
+debug: true
+default-regexp:
+    - (?i)['"]?(password|passwd|token|api_key|secret)['"]?[=:\s][\s]*?['"]?([^'"\s]+)['"]?
+defaultexclude: ^(\.git|.*\.zip|.*\.gz|.*\.xz|.*\.bz2|.*\.zstd|.*\.7z|.*\.dll|.*\.iso|.*\.bin|.*\.tar|.*\.exe)$
+exclude: ""
+fptn: .*
+path-exclude: ""
+profile: ""
+regexp: []
+save-config: cred-detect-config.yaml
+skipbinary: true
+words-list-url: https://raw.githubusercontent.com/dwyl/english-words/master/words.txt

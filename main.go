@@ -60,9 +60,13 @@ type VHost struct {
 	StaticFallback  string `json:"static_fallback"`   // SPA fallback (e.g. "index.html")
 	StaticStripPath string `json:"static_strip_path"` // Strip URL prefix before resolving
 
-	// Auth
-	JWTSecret    string `json:"jwt_secret"`
-	JWTPublicKey string `json:"jwt_public_key"` // RS256 PEM public key; when set RS256 is used
+	// Auth — three mutually exclusive modes:
+	//   • jwt_secret set              → HS256 (shared secret)
+	//   • jwt_key + jwt_pub set       → RS256 (file paths to PEM keys)
+	//   • all empty                   → authentication disabled
+	JWTSecret  string `json:"jwt_secret"` // HS256 shared secret
+	JWTKeyFile string `json:"jwt_key"`    // RS256: path to PEM private-key file (optional for proxy/verify-only)
+	JWTPubFile string `json:"jwt_pub"`    // RS256: path to PEM public-key file  (required for RS256)
 
 	// TLS (per-vhost / per-port)
 	SSLEnabled bool   `json:"ssl_enabled"`
@@ -74,12 +78,23 @@ type VHost struct {
 // Runtime handler types
 // -----------------------------------------------------------------------
 
+// authMode describes which JWT algorithm a vhost uses.
+type authMode int
+
+const (
+	authNone  authMode = iota // no authentication
+	authHS256                 // HMAC-SHA256 shared secret
+	authRS256                 // RSA-SHA256 public/private key pair
+)
+
 // vhostHandler holds the fully-initialised handler for one vhost.
 type vhostHandler struct {
 	vhost        VHost
 	proxy        *httputil.ReverseProxy // proxy mode; nil in static mode
 	staticFS     http.Handler           // static mode; nil in proxy mode
 	requiresAuth bool
+	auth         authMode
+	rsaPub       *rsa.PublicKey // pre-parsed at startup; nil for HS256/none
 }
 
 // portGroup bundles all vhosts that share the same listen address:port.
@@ -242,7 +257,6 @@ func main() {
 
 	var wg sync.WaitGroup
 	for _, grp := range groups {
-		grp := grp
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -326,13 +340,18 @@ func (grp *portGroup) route(w http.ResponseWriter, r *http.Request) {
 
 	// JWT auth (localhost requests bypass auth)
 	if h.requiresAuth && !isLocalhost(remoteIP) {
-		ok, err := validateJWT(r, h)
-		if !ok || err != nil {
-			if err != nil {
-				log.Printf("JWT [%s]: %v", h.vhost.Hostname, err)
-			}
+		res, err := validateJWT(r, h)
+		if err != nil {
+			log.Printf("JWT [%s]: %v", h.vhost.Hostname, err)
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return
+		}
+		// On first auth (token arrived via header / query param, not cookie),
+		// set a session cookie so subsequent browser requests work seamlessly.
+		// Errors from Set-Cookie are silently ignored — API clients that don't
+		// support cookies continue working via their existing token source.
+		if _, cookieErr := r.Cookie(jwtCookieName); cookieErr != nil {
+			setSessionCookie(w, r, res, h.vhost)
 		}
 	}
 
@@ -355,11 +374,76 @@ func (grp *portGroup) handlerFor(hostname string) *vhostHandler {
 // Handler construction
 // -----------------------------------------------------------------------
 
-func createVHostHandler(vhost VHost) (*vhostHandler, error) {
-	if vhost.StaticDir != "" {
-		return createStaticHandler(vhost)
+// resolveAuth determines the auth mode for a vhost, pre-parses the RSA
+// public key from disk when RS256 is configured, and emits startup warnings
+// for ambiguous or incomplete configurations.
+func resolveAuth(vhost VHost) (authMode, *rsa.PublicKey, error) {
+	hasSecret := vhost.JWTSecret != ""
+	hasPub := vhost.JWTPubFile != ""
+	hasKey := vhost.JWTKeyFile != ""
+
+	switch {
+	case hasSecret && !hasPub && !hasKey:
+		// HS256 — shared secret only
+		return authHS256, nil, nil
+
+	case !hasSecret && hasPub:
+		// RS256 — public key file required; private key file is optional
+		// (proxy/static servers only need to verify, not sign)
+		if hasSecret {
+			log.Printf("[WARN] vhost %s: jwt_secret is set alongside jwt_pub — jwt_secret is ignored for RS256", vhost.Hostname)
+		}
+		pemBytes, err := os.ReadFile(vhost.JWTPubFile)
+		if err != nil {
+			return authNone, nil, fmt.Errorf("jwt_pub %q: %v", vhost.JWTPubFile, err)
+		}
+		pub, err := parseRSAPublicKey(string(pemBytes))
+		if err != nil {
+			return authNone, nil, fmt.Errorf("jwt_pub %q: %v", vhost.JWTPubFile, err)
+		}
+		if hasKey {
+			// Validate the private key file is readable at startup even though
+			// this process only uses it for verification (future signing support).
+			if _, err := os.Stat(vhost.JWTKeyFile); err != nil {
+				log.Printf("[WARN] vhost %s: jwt_key %q not accessible: %v", vhost.Hostname, vhost.JWTKeyFile, err)
+			}
+		}
+		return authRS256, pub, nil
+
+	case !hasSecret && !hasPub && !hasKey:
+		// No auth config — disable authentication
+		log.Printf("[WARN] vhost %s: no jwt_secret or jwt_pub set — authentication disabled", vhost.Hostname)
+		return authNone, nil, nil
+
+	default:
+		// Ambiguous: both jwt_secret and jwt_pub/jwt_key provided
+		return authNone, nil, fmt.Errorf(
+			"vhost %s: ambiguous auth config — set either jwt_secret (HS256) or jwt_pub+jwt_key (RS256), not both",
+			vhost.Hostname,
+		)
 	}
-	return createProxyHandler(vhost)
+}
+
+func createVHostHandler(vhost VHost) (*vhostHandler, error) {
+	mode, rsaPub, err := resolveAuth(vhost)
+	if err != nil {
+		return nil, err
+	}
+
+	var h *vhostHandler
+	if vhost.StaticDir != "" {
+		h, err = createStaticHandler(vhost)
+	} else {
+		h, err = createProxyHandler(vhost)
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	h.auth = mode
+	h.rsaPub = rsaPub
+	h.requiresAuth = mode != authNone
+	return h, nil
 }
 
 func createProxyHandler(vhost VHost) (*vhostHandler, error) {
@@ -431,9 +515,9 @@ func createProxyHandler(vhost VHost) (*vhostHandler, error) {
 	}
 
 	return &vhostHandler{
-		vhost:        vhost,
-		proxy:        proxy,
-		requiresAuth: vhost.JWTSecret != "",
+		vhost: vhost,
+		proxy: proxy,
+		// requiresAuth / auth / rsaPub are set by createVHostHandler
 	}, nil
 }
 
@@ -475,9 +559,9 @@ func createStaticHandler(vhost VHost) (*vhostHandler, error) {
 	}
 
 	return &vhostHandler{
-		vhost:        vhost,
-		staticFS:     h,
-		requiresAuth: vhost.JWTSecret != "",
+		vhost:    vhost,
+		staticFS: h,
+		// requiresAuth / auth / rsaPub are set by createVHostHandler
 	}, nil
 }
 
@@ -614,37 +698,152 @@ func loadConfig() {
 // JWT validation
 // -----------------------------------------------------------------------
 
-func validateJWT(r *http.Request, h *vhostHandler) (bool, error) {
-	var token string
+const jwtCookieName = "jwt_session"
+
+// jwtResult carries the validated token string, its parsed form, and the
+// expiry time extracted from the mandatory "exp" claim.
+type jwtResult struct {
+	raw    string
+	token  *jwt.Token
+	expiry time.Time
+}
+
+// extractTokenString looks for a JWT in (priority order):
+//  1. Cookie "jwt_session"
+//  2. Authorization: Bearer <token>
+//  3. ?access_token= query parameter
+func extractTokenString(r *http.Request) string {
+	if c, err := r.Cookie(jwtCookieName); err == nil && c.Value != "" {
+		return c.Value
+	}
 	if auth := r.Header.Get("Authorization"); strings.HasPrefix(auth, "Bearer ") {
-		token = strings.TrimPrefix(auth, "Bearer ")
+		return strings.TrimPrefix(auth, "Bearer ")
 	}
-	if token == "" {
-		token = r.URL.Query().Get("access_token")
+	return r.URL.Query().Get("access_token")
+}
+
+// parseRSAPublicKey parses a PEM-encoded RSA public key (PKIX or PKCS#1).
+func parseRSAPublicKey(pemStr string) (*rsa.PublicKey, error) {
+	block, _ := pem.Decode([]byte(pemStr))
+	if block == nil {
+		return nil, fmt.Errorf("failed to decode PEM block")
 	}
-	if token == "" {
-		return false, fmt.Errorf("no token provided")
+	switch block.Type {
+	case "PUBLIC KEY": // PKIX / SubjectPublicKeyInfo
+		pub, err := x509.ParsePKIXPublicKey(block.Bytes)
+		if err != nil {
+			return nil, fmt.Errorf("ParsePKIXPublicKey: %v", err)
+		}
+		rsaPub, ok := pub.(*rsa.PublicKey)
+		if !ok {
+			return nil, fmt.Errorf("not an RSA public key")
+		}
+		return rsaPub, nil
+	case "RSA PUBLIC KEY": // PKCS#1
+		return x509.ParsePKCS1PublicKey(block.Bytes)
+	default:
+		return nil, fmt.Errorf("unsupported PEM block type %q", block.Type)
+	}
+}
+
+// validateJWT validates the JWT from the request and returns a jwtResult.
+// It enforces:
+//   - correct signing method (HS256 or RS256 based on resolved authMode)
+//   - presence and validity of the "exp" claim
+func validateJWT(r *http.Request, h *vhostHandler) (*jwtResult, error) {
+	raw := extractTokenString(r)
+	if raw == "" {
+		return nil, fmt.Errorf("no token provided")
 	}
 
-	parsed, err := jwt.Parse(token, func(t *jwt.Token) (interface{}, error) {
-		if h.vhost.JWTPublicKey == "" {
+	// Choose the key-func based on the pre-resolved auth mode.
+	var keyFunc jwt.Keyfunc
+	switch h.auth {
+	case authHS256:
+		keyFunc = func(t *jwt.Token) (interface{}, error) {
 			if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
-				return nil, fmt.Errorf("unexpected signing method: %v", t.Header["alg"])
+				return nil, fmt.Errorf("expected HS256, got %v", t.Header["alg"])
 			}
 			return []byte(h.vhost.JWTSecret), nil
 		}
-		if _, ok := t.Method.(*jwt.SigningMethodRSA); !ok {
-			return nil, fmt.Errorf("unexpected signing method: %v", t.Header["alg"])
+	case authRS256:
+		// rsaPub was parsed from disk at startup — zero allocation per request.
+		pub := h.rsaPub
+		keyFunc = func(t *jwt.Token) (interface{}, error) {
+			if _, ok := t.Method.(*jwt.SigningMethodRSA); !ok {
+				return nil, fmt.Errorf("expected RS256, got %v", t.Header["alg"])
+			}
+			return pub, nil
 		}
-		return h.vhost.JWTPublicKey, nil
-	})
+	default:
+		// authNone should never reach here (route() guards on requiresAuth),
+		// but be defensive.
+		return nil, fmt.Errorf("auth not configured for this vhost")
+	}
+
+	parsed, err := jwt.Parse(raw,
+		keyFunc,
+		jwt.WithExpirationRequired(), // "exp" claim is mandatory
+		jwt.WithIssuedAt(),           // reject tokens with future iat
+	)
 	if err != nil {
-		return false, err
+		return nil, err
 	}
+	if !parsed.Valid {
+		return nil, fmt.Errorf("token invalid")
+	}
+
+	// Extract expiry from the validated claims.
+	claims, ok := parsed.Claims.(jwt.MapClaims)
+	if !ok {
+		return nil, fmt.Errorf("unexpected claims type")
+	}
+	expVal, ok := claims["exp"]
+	if !ok {
+		return nil, fmt.Errorf("missing exp claim")
+	}
+	expFloat, ok := expVal.(float64)
+	if !ok {
+		return nil, fmt.Errorf("exp claim is not a number")
+	}
+	expiry := time.Unix(int64(expFloat), 0)
+	if time.Now().After(expiry) {
+		return nil, fmt.Errorf("token expired")
+	}
+
 	if DEBUG {
-		log.Printf("JWT claims [%s]: %+v", h.vhost.Hostname, parsed.Claims)
+		log.Printf("JWT valid [%s] exp=%s claims=%+v", h.vhost.Hostname, expiry.UTC(), claims)
 	}
-	return parsed.Valid, nil
+
+	return &jwtResult{raw: raw, token: parsed, expiry: expiry}, nil
+}
+
+// setSessionCookie writes the JWT as an HttpOnly session cookie whose Max-Age
+// matches the token's exp claim. Errors are intentionally swallowed — clients
+// that do not support cookies (e.g. API callers) must keep using the
+// Authorization header or ?access_token= on every request.
+func setSessionCookie(w http.ResponseWriter, r *http.Request, res *jwtResult, vhost VHost) {
+	ttl := time.Until(res.expiry)
+	if ttl <= 0 {
+		return // already expired; do not bother setting
+	}
+	cookie := &http.Cookie{
+		Name:     jwtCookieName,
+		Value:    res.raw,
+		Path:     "/",
+		MaxAge:   int(ttl.Seconds()),
+		HttpOnly: true,                 // not accessible via JS
+		SameSite: http.SameSiteLaxMode, // sensible CSRF default
+		Secure:   vhost.SSLEnabled,     // Secure flag only when the vhost uses TLS
+	}
+	// Best-effort: if the client ignores Set-Cookie we simply fall through.
+	// http.SetCookie itself never returns an error; we just guard against
+	// any future-proof concern by discarding implicitly.
+	http.SetCookie(w, cookie)
+	if DEBUG {
+		log.Printf("Set-Cookie %s for %s (ttl=%s secure=%v)",
+			jwtCookieName, vhost.Hostname, ttl.Round(time.Second), vhost.SSLEnabled)
+	}
 }
 
 // -----------------------------------------------------------------------

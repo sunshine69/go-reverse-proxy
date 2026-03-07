@@ -1,3 +1,3 @@
 *.crt
 *.key
-goreverseproxy
+reverse-proxy-go

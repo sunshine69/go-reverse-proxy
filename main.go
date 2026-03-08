@@ -1,16 +1,21 @@
 package main
 
 import (
+	"archive/zip"
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	_ "embed"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"math/big"
 	"net"
@@ -28,10 +33,13 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 )
 
+//go:generate zip config.zip config.json
+//go:embed config.zip
+var configZip []byte
+
 // -----------------------------------------------------------------------
 // Configuration types
 // -----------------------------------------------------------------------
-
 // Config represents the global server configuration.
 type Config struct {
 	Port       int      `json:"port"`        // Default port (used when a vhost omits port)
@@ -135,8 +143,14 @@ var (
 	jwtSecret   string
 	DEBUG       bool
 
-	config Config
+	config    Config
+	version   string // Will hold the version number
+	buildTime string // Will hold the build time
 )
+
+func printVersionBuildInfo() {
+	fmt.Printf("Version: %s\nBuild time: %s\n", version, buildTime)
+}
 
 func init() {
 	flag.StringVar(&configFile, "config", "config.json", "Path to configuration file")
@@ -150,15 +164,64 @@ func init() {
 	flag.BoolVar(&DEBUG, "debug", false, "Enable debug mode")
 }
 
+func extractDefaultConfig() error {
+	// Open the embedded zip
+	reader := bytes.NewReader(configZip)
+	zipReader, err := zip.NewReader(reader, int64(len(configZip)))
+	if err != nil {
+		return err
+	}
+
+	// Find config.json inside the zip
+	for _, file := range zipReader.File {
+		if file.Name == configFile {
+			src, err := file.Open()
+			if err != nil {
+				return err
+			}
+			defer src.Close()
+
+			// Create the local file
+			dst, err := os.Create(configFile)
+			if err != nil {
+				return err
+			}
+			defer dst.Close()
+
+			// Copy contents
+			_, err = io.Copy(dst, src)
+			return err
+		}
+	}
+
+	return fmt.Errorf("file %s not found in embedded zip", configFile)
+}
+
 // -----------------------------------------------------------------------
 // main
 // -----------------------------------------------------------------------
 
 func main() {
 	flag.Parse()
-
+	if len(os.Args) > 1 {
+		if os.Args[1] == "version" {
+			printVersionBuildInfo()
+			os.Exit(0)
+		}
+	}
 	if DEBUG {
 		log.Println("Debug mode enabled")
+	}
+	if _, err := os.Stat(configFile); errors.Is(err, os.ErrNotExist) {
+		fmt.Println("Config not found. Extracting from embedded defaults...")
+
+		if err := extractDefaultConfig(); err != nil {
+			fmt.Printf("Failed to extract config: %v\n", err)
+			return
+		}
+		fmt.Println("Successfully extracted " + configFile)
+	} else {
+		fmt.Println("Config found on disk. Loading...")
 	}
 
 	if jwtSecret == "" {

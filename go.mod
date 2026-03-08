@@ -1,4 +1,4 @@
-module goreverseproxy
+module reverse-proxy-go
 
 go 1.24.1
 

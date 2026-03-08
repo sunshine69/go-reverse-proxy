@@ -92,9 +92,9 @@ type VHost struct {
 type authMode int
 
 const (
-	authNone   authMode = iota // no authentication
-	authHS256                  // HMAC-SHA256 shared secret
-	authRS256                  // RSA-SHA256 public/private key pair
+	authNone  authMode = iota // no authentication
+	authHS256                 // HMAC-SHA256 shared secret
+	authRS256                 // RSA-SHA256 public/private key pair
 )
 
 // vhostHandler holds the fully-initialised handler for one vhost.
@@ -789,7 +789,6 @@ func loginPath(vhost VHost) string {
 	return vhost.PathBase + "/__auth"
 }
 
-
 // jwtResult carries the validated token string, its parsed form, and the
 // expiry time extracted from the mandatory "exp" claim.
 type jwtResult struct {
@@ -874,7 +873,7 @@ func validateJWT(r *http.Request, h *vhostHandler) (*jwtResult, error) {
 	parsed, err := jwt.Parse(raw,
 		keyFunc,
 		jwt.WithExpirationRequired(), // "exp" claim is mandatory
-		jwt.WithIssuedAt(),            // reject tokens with future iat
+		jwt.WithIssuedAt(),           // reject tokens with future iat
 	)
 	if err != nil {
 		return nil, err
@@ -940,7 +939,6 @@ func setSessionCookie(w http.ResponseWriter, r *http.Request, res *jwtResult, vh
 			cookieName(vhost), vhost.Hostname, ttl.Round(time.Second), vhost.SSLEnabled)
 	}
 }
-
 
 // -----------------------------------------------------------------------
 // Login page (built-in, served at /__auth)
@@ -1178,6 +1176,7 @@ const loginHTML = `<!DOCTYPE html>
     <button type="submit">Sign in &#8594;</button>
   </form>
   <p class="hint">Token is stored as a secure session cookie and expires with the token.</p>
+<p class="hint"><a href="https://note.kaykraft.org/assets/media/html/jwt-tool.html" target="_blank">JWT Tool</a></p>
 </div>
 </body>
 </html>`

@@ -60,6 +60,16 @@ type VHost struct {
 	StaticFallback  string `json:"static_fallback"`   // SPA fallback (e.g. "index.html")
 	StaticStripPath string `json:"static_strip_path"` // Strip URL prefix before resolving
 
+	// Path base — strip this prefix from all incoming URLs before routing.
+	// Useful in Kubernetes when an ingress forwards /myapp/... without
+	// rewriting to / so the app sees the full path including the prefix.
+	// The login page and cookie path are also scoped under this prefix.
+	// Example: "/myapp"  (no trailing slash; empty = disabled)
+	PathBase string `json:"path_base"`
+
+	// Session cookie name for this vhost (default "jwt_session").
+	SessionCookieName string `json:"session_cookie_name"`
+
 	// Auth — three mutually exclusive modes:
 	//   • jwt_secret set              → HS256 (shared secret)
 	//   • jwt_key + jwt_pub set       → RS256 (file paths to PEM keys)
@@ -340,8 +350,8 @@ func (grp *portGroup) route(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Built-in login page — serves before auth so unauthenticated browsers
-	// can reach it. It is only registered when auth is enabled for this vhost.
-	if h.requiresAuth && r.URL.Path == authLoginPath {
+	// can reach it. Matches the full path including PathBase (e.g. /myapp/__auth).
+	if h.requiresAuth && r.URL.Path == loginPath(h.vhost) {
 		serveLoginPage(w, r, h.vhost)
 		return
 	}
@@ -354,7 +364,7 @@ func (grp *portGroup) route(w http.ResponseWriter, r *http.Request) {
 			// API clients (non-browser or explicit token requests) get a plain 401.
 			// Browser requests get a redirect to the built-in login page instead.
 			if isBrowserRequest(r) {
-				redirectToLogin(w, r)
+				redirectToLogin(w, r, h.vhost)
 			} else {
 				http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			}
@@ -364,7 +374,7 @@ func (grp *portGroup) route(w http.ResponseWriter, r *http.Request) {
 		// set a session cookie so subsequent browser requests work seamlessly.
 		// Errors from Set-Cookie are silently ignored — API clients that don't
 		// support cookies continue working via their existing token source.
-		if _, cookieErr := r.Cookie(jwtCookieName); cookieErr != nil {
+		if _, cookieErr := r.Cookie(cookieName(h.vhost)); cookieErr != nil {
 			setSessionCookie(w, r, res, h.vhost)
 		}
 	}
@@ -439,6 +449,9 @@ func resolveAuth(vhost VHost) (authMode, *rsa.PublicKey, error) {
 }
 
 func createVHostHandler(vhost VHost) (*vhostHandler, error) {
+	// Normalise PathBase once at startup so all comparisons are consistent.
+	vhost.PathBase = normPathBase(vhost.PathBase)
+
 	mode, rsaPub, err := resolveAuth(vhost)
 	if err != nil {
 		return nil, err
@@ -500,6 +513,23 @@ func createProxyHandler(vhost VHost) (*vhostHandler, error) {
 			// virtual hosting on the upstream side works correctly.
 			preq.Out.Host = targetURL.Host
 
+			// Strip PathBase so the upstream sees a clean "/" root.
+			// (Static mode handles this via StripPrefix instead.)
+			if pb := vhost.PathBase; pb != "" {
+				stripped := strings.TrimPrefix(preq.Out.URL.Path, pb)
+				if stripped == "" {
+					stripped = "/"
+				}
+				preq.Out.URL.Path = stripped
+				if preq.Out.URL.RawPath != "" {
+					raw := strings.TrimPrefix(preq.Out.URL.RawPath, pb)
+					if raw == "" {
+						raw = "/"
+					}
+					preq.Out.URL.RawPath = raw
+				}
+			}
+
 			// Populate X-Forwarded-For / X-Forwarded-Host / X-Forwarded-Proto
 			// from the verified inbound connection data (not from client headers).
 			preq.SetXForwarded()
@@ -546,21 +576,35 @@ func createStaticHandler(vhost VHost) (*vhostHandler, error) {
 
 	fs := http.FileServer(http.Dir(vhost.StaticDir))
 
-	var h http.Handler = fs
+	// Use a per-vhost ServeMux registered at the full route path (pathBase+"/").
+	// This mirrors the reference implementation exactly:
+	//   mux.Handle(routePath, http.StripPrefix(stripPrefix, fileServer))
+	//
+	// Because the mux pattern includes PathBase, http.ServeMux sets r.URL.Path
+	// correctly before FileServer sees it, so all generated hrefs and redirects
+	// already include PathBase — no response rewriting needed.
+	routePath := vhost.PathBase + "/"
+	stripPrefix := vhost.PathBase
 	if vhost.StaticStripPath != "" {
-		h = http.StripPrefix(vhost.StaticStripPath, fs)
+		// Explicit override takes full control.
+		routePath = vhost.StaticStripPath + "/"
+		stripPrefix = vhost.StaticStripPath
 	}
+
+	if DEBUG {
+		log.Printf("Static [%s] routePath=%q stripPrefix=%q dir=%q",
+			vhost.Hostname, routePath, stripPrefix, vhost.StaticDir)
+	}
+
+	fileHandler := http.StripPrefix(stripPrefix, fs)
 
 	if vhost.StaticFallback != "" {
 		staticDir := vhost.StaticDir
 		fallback := strings.TrimPrefix(vhost.StaticFallback, "/")
-		strip := vhost.StaticStripPath
-		inner := h
-		h = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			p := r.URL.Path
-			if strip != "" {
-				p = strings.TrimPrefix(p, strip)
-			}
+		inner := fileHandler
+		fileHandler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// Derive on-disk path from the already-stripped URL.
+			p := strings.TrimPrefix(r.URL.Path, stripPrefix)
 			if !strings.HasPrefix(p, "/") {
 				p = "/" + p
 			}
@@ -571,6 +615,10 @@ func createStaticHandler(vhost VHost) (*vhostHandler, error) {
 			inner.ServeHTTP(w, r)
 		})
 	}
+
+	mux := http.NewServeMux()
+	mux.Handle(routePath, fileHandler)
+	h := http.Handler(mux)
 
 	return &vhostHandler{
 		vhost:    vhost,
@@ -712,7 +760,35 @@ func loadConfig() {
 // JWT validation
 // -----------------------------------------------------------------------
 
-const jwtCookieName = "jwt_session"
+// cookieName returns the session cookie name for a vhost,
+// falling back to "jwt_session" when not configured.
+func cookieName(vhost VHost) string {
+	if vhost.SessionCookieName != "" {
+		return vhost.SessionCookieName
+	}
+	return "jwt_session"
+}
+
+// normPathBase ensures PathBase has a leading slash and no trailing slash,
+// e.g. "" → "", "myapp" → "/myapp", "/myapp/" → "/myapp".
+// Called once at startup so every path comparison is consistent.
+func normPathBase(s string) string {
+	if s == "" {
+		return ""
+	}
+	s = strings.TrimRight(s, "/")
+	if !strings.HasPrefix(s, "/") {
+		s = "/" + s
+	}
+	return s
+}
+
+// loginPath returns the absolute path of the built-in login page for a vhost,
+// respecting the vhost's PathBase prefix.
+func loginPath(vhost VHost) string {
+	return vhost.PathBase + "/__auth"
+}
+
 
 // jwtResult carries the validated token string, its parsed form, and the
 // expiry time extracted from the mandatory "exp" claim.
@@ -723,11 +799,11 @@ type jwtResult struct {
 }
 
 // extractTokenString looks for a JWT in (priority order):
-//  1. Cookie "jwt_session"
+//  1. Session cookie (name configured per-vhost, default "jwt_session")
 //  2. Authorization: Bearer <token>
 //  3. ?access_token= query parameter
-func extractTokenString(r *http.Request) string {
-	if c, err := r.Cookie(jwtCookieName); err == nil && c.Value != "" {
+func extractTokenString(r *http.Request, vhost VHost) string {
+	if c, err := r.Cookie(cookieName(vhost)); err == nil && c.Value != "" {
 		return c.Value
 	}
 	if auth := r.Header.Get("Authorization"); strings.HasPrefix(auth, "Bearer ") {
@@ -765,7 +841,7 @@ func parseRSAPublicKey(pemStr string) (*rsa.PublicKey, error) {
 //   - correct signing method (HS256 or RS256 based on resolved authMode)
 //   - presence and validity of the "exp" claim
 func validateJWT(r *http.Request, h *vhostHandler) (*jwtResult, error) {
-	raw := extractTokenString(r)
+	raw := extractTokenString(r, h.vhost)
 	if raw == "" {
 		return nil, fmt.Errorf("no token provided")
 	}
@@ -841,14 +917,19 @@ func setSessionCookie(w http.ResponseWriter, r *http.Request, res *jwtResult, vh
 	if ttl <= 0 {
 		return // already expired; do not bother setting
 	}
+	// Scope the cookie to PathBase so it does not bleed into sibling apps.
+	cookiePath := vhost.PathBase
+	if cookiePath == "" {
+		cookiePath = "/"
+	}
 	cookie := &http.Cookie{
-		Name:     jwtCookieName,
+		Name:     cookieName(vhost),
 		Value:    res.raw,
-		Path:     "/",
+		Path:     cookiePath,
 		MaxAge:   int(ttl.Seconds()),
-		HttpOnly: true,                  // not accessible via JS
-		SameSite: http.SameSiteLaxMode, // sensible CSRF default
-		Secure:   vhost.SSLEnabled,     // Secure flag only when the vhost uses TLS
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+		Secure:   vhost.SSLEnabled,
 	}
 	// Best-effort: if the client ignores Set-Cookie we simply fall through.
 	// http.SetCookie itself never returns an error; we just guard against
@@ -856,7 +937,7 @@ func setSessionCookie(w http.ResponseWriter, r *http.Request, res *jwtResult, vh
 	http.SetCookie(w, cookie)
 	if DEBUG {
 		log.Printf("Set-Cookie %s for %s (ttl=%s secure=%v)",
-			jwtCookieName, vhost.Hostname, ttl.Round(time.Second), vhost.SSLEnabled)
+			cookieName(vhost), vhost.Hostname, ttl.Round(time.Second), vhost.SSLEnabled)
 	}
 }
 
@@ -864,8 +945,6 @@ func setSessionCookie(w http.ResponseWriter, r *http.Request, res *jwtResult, vh
 // -----------------------------------------------------------------------
 // Login page (built-in, served at /__auth)
 // -----------------------------------------------------------------------
-
-const authLoginPath = "/__auth"
 
 // isBrowserRequest returns true when the client is likely a browser —
 // it accepts HTML and is not sending an explicit Authorization header.
@@ -880,37 +959,44 @@ func isBrowserRequest(r *http.Request) bool {
 
 // redirectToLogin sends a 302 to the built-in login page, encoding the
 // original URL as a ?next= query parameter so the page can redirect back.
-func redirectToLogin(w http.ResponseWriter, r *http.Request) {
+// The login path is prefixed with vhost.PathBase when set.
+func redirectToLogin(w http.ResponseWriter, r *http.Request, vhost VHost) {
 	next := r.URL.RequestURI()
-	http.Redirect(w, r, authLoginPath+"?next="+url.QueryEscape(next), http.StatusFound)
+	http.Redirect(w, r, loginPath(vhost)+"?next="+url.QueryEscape(next), http.StatusFound)
 }
 
 // serveLoginPage handles GET (show form) and POST (accept token) for /__auth.
 func serveLoginPage(w http.ResponseWriter, r *http.Request, vhost VHost) {
 	next := r.URL.Query().Get("next")
 	if next == "" {
-		next = "/"
+		base := vhost.PathBase
+		if base == "" {
+			base = "/"
+		}
+		next = base
 	}
 	// Sanitise the redirect target — only allow same-origin relative paths.
 	if !strings.HasPrefix(next, "/") || strings.HasPrefix(next, "//") {
-		next = "/"
+		next = vhost.PathBase + "/"
+		if next == "/" {
+			next = "/"
+		}
 	}
 
 	switch r.Method {
 	case http.MethodPost:
 		serveLoginPost(w, r, vhost, next)
 	default:
-		serveLoginGet(w, r, next)
+		serveLoginGet(w, r, next, vhost)
 	}
 }
 
 // serveLoginGet renders the token-entry form.
-func serveLoginGet(w http.ResponseWriter, r *http.Request, next string) {
+func serveLoginGet(w http.ResponseWriter, r *http.Request, next string, vhost VHost) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(http.StatusUnauthorized)
-	// next is already validated as a safe relative path above.
-	_ = loginPageTmpl(w, next, "")
+	_ = loginPageTmpl(w, next, "", vhost.PathBase)
 }
 
 // serveLoginPost validates the submitted token, sets the session cookie on
@@ -919,7 +1005,7 @@ func serveLoginGet(w http.ResponseWriter, r *http.Request, next string) {
 func serveLoginPost(w http.ResponseWriter, r *http.Request, vhost VHost, next string) {
 	if err := r.ParseForm(); err != nil {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		_ = loginPageTmpl(w, next, "Could not parse form.")
+		_ = loginPageTmpl(w, next, "Could not parse form.", vhost.PathBase)
 		return
 	}
 
@@ -927,7 +1013,7 @@ func serveLoginPost(w http.ResponseWriter, r *http.Request, vhost VHost, next st
 	if tokenStr == "" {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.WriteHeader(http.StatusUnauthorized)
-		_ = loginPageTmpl(w, next, "Please enter a token.")
+		_ = loginPageTmpl(w, next, "Please enter a token.", vhost.PathBase)
 		return
 	}
 
@@ -947,7 +1033,7 @@ func serveLoginPost(w http.ResponseWriter, r *http.Request, vhost VHost, next st
 	if err != nil {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.WriteHeader(http.StatusInternalServerError)
-		_ = loginPageTmpl(w, next, "Server auth configuration error.")
+		_ = loginPageTmpl(w, next, "Server auth configuration error.", vhost.PathBase)
 		return
 	}
 	tmpHandler := &vhostHandler{vhost: vhost, auth: mode, rsaPub: rsaPub, requiresAuth: true}
@@ -959,7 +1045,7 @@ func serveLoginPost(w http.ResponseWriter, r *http.Request, vhost VHost, next st
 		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.WriteHeader(http.StatusUnauthorized)
-		_ = loginPageTmpl(w, next, "Invalid or expired token.")
+		_ = loginPageTmpl(w, next, "Invalid or expired token.", vhost.PathBase)
 		return
 	}
 
@@ -971,14 +1057,19 @@ func serveLoginPost(w http.ResponseWriter, r *http.Request, vhost VHost, next st
 // loginPageTmpl writes the HTML login form to w and returns any write error.
 // Uses strings.NewReplacer instead of fmt.Fprintf so that the % characters
 // inside the CSS rules (e.g. width:100%) are never misread as format verbs.
-func loginPageTmpl(w http.ResponseWriter, next, errMsg string) error {
+// pathBase is the vhost's PathBase (already normalised, may be "").
+func loginPageTmpl(w http.ResponseWriter, next, errMsg, pathBase string) error {
 	errHTML := ""
 	if errMsg != "" {
 		errHTML = `<p class="err">` + htmlEscape(errMsg) + `</p>`
 	}
+	// The form action must include PathBase so the browser POSTs to the full
+	// ingress path. The stripped "/__auth" alone would 404 through the ingress.
+	loginAction := pathBase + "/__auth"
 	replacer := strings.NewReplacer(
 		"{{.Next}}", htmlEscape(next),
 		"{{.Error}}", errHTML,
+		"{{.LoginPath}}", htmlEscape(loginAction),
 	)
 	_, err := replacer.WriteString(w, loginHTML)
 	return err
@@ -1080,7 +1171,7 @@ const loginHTML = `<!DOCTYPE html>
   <div class="icon">&#128274;</div>
   <h1>Authentication required</h1>
   <p class="sub">Paste your JWT token below to continue.</p>
-  <form method="POST" action="/__auth?next={{.Next}}">
+  <form method="POST" action="{{.LoginPath}}?next={{.Next}}">
     <label for="token">JWT Token</label>
     <textarea id="token" name="token" placeholder="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..." autofocus spellcheck="false" autocomplete="off"></textarea>
     {{.Error}}

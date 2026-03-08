@@ -25,6 +25,19 @@
       "custom_headers": {
         "Authorization": "Bearer <JWT_TOKEN>"
       }
+    },
+    {
+      "hostname": "example.com",
+      "path_base": "/pub",
+      "port": 8080,
+      "static_dir": "/var/www/html",
+      "static_404": "/var/www/docs/404.html",
+      "jwt_secret": "",
+      "ssl_enabled": true,
+      "ssl_cert": "/path/cert",
+      "ssl_key": "/path/key",
+      "custom_headers": {}
     }
+
   ]
 }

@@ -565,6 +565,8 @@ func createProxyHandler(vhost VHost) (*vhostHandler, error) {
 		tr.TLSClientConfig = &tls.Config{InsecureSkipVerify: true} //nolint:gosec
 	}
 
+	log.Printf("Proxy from %s => %s\n", vhost.Hostname, vhost.UpstreamURL)
+
 	// Use Rewrite instead of the deprecated Director.
 	// Rewrite runs on the outbound copy of the request, so:
 	//   - hop-by-hop headers are already stripped before Rewrite is called
@@ -615,9 +617,7 @@ func createProxyHandler(vhost VHost) (*vhostHandler, error) {
 				preq.Out.Header.Set(k, v)
 			}
 
-			if DEBUG {
-				log.Printf("Rewrite [%s] → %s%s", vhost.Hostname, targetURL.Host, preq.Out.URL.Path)
-			}
+			log.Printf("Rewrite [%s] → %s%s", vhost.Hostname, targetURL.Host, preq.Out.URL.Path)
 		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
 			log.Printf("Proxy error [%s]: %v", vhost.Hostname, err)
@@ -658,10 +658,7 @@ func createStaticHandler(vhost VHost) (*vhostHandler, error) {
 		stripPrefix = vhost.StaticStripPath
 	}
 
-	if DEBUG {
-		log.Printf("Static [%s] routePath=%q stripPrefix=%q dir=%q",
-			vhost.Hostname, routePath, stripPrefix, vhost.StaticDir)
-	}
+	log.Printf("Static [%s] routePath=%q stripPrefix=%q dir=%q", vhost.Hostname, routePath, stripPrefix, vhost.StaticDir)
 
 	fileHandler := http.StripPrefix(stripPrefix, fs)
 

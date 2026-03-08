@@ -1,3 +1,4 @@
+batch-size: 8
 check-mode: letter+word
 debug: true
 default-regexp:
@@ -5,9 +6,12 @@ default-regexp:
 defaultexclude: ^(\.git|.*\.zip|.*\.gz|.*\.xz|.*\.bz2|.*\.zstd|.*\.7z|.*\.dll|.*\.iso|.*\.bin|.*\.tar|.*\.exe)$
 exclude: ""
 fptn: .*
+group-index-a: []
+group-index-b: []
 path-exclude: ""
 profile: ""
 regexp: []
 save-config: cred-detect-config.yaml
 skipbinary: true
+words-file: ""
 words-list-url: https://raw.githubusercontent.com/dwyl/english-words/master/words.txt

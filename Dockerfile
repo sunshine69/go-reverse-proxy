@@ -9,6 +9,8 @@ ARG BINARY_NAME="reverse-proxy-go"
 ARG PORT="8080"
 ARG BUILD_TIME="unknown"
 
+RUN apk add zip 
+
 RUN go generate && go build -trimpath -ldflags="-X main.version=${APP_VERSION} -X main.buildTime=$(date +%Y%m%d%H%M) -extldflags=-static -w -s" --tags "osusergo,netgo" -o ${BINARY_NAME}
 CMD ["/app/${BINARY_NAME}"]
 
@@ -21,4 +23,4 @@ COPY --from=BUILD_BASE /app/${BINARY_NAME} /${BINARY_NAME}
 COPY --from=BUILD_BASE /imagetmp /tmp
 ENV TZ=Australia/Brisbane
 EXPOSE $PORT
-ENTRYPOINT [ "/$BINARY_NAME" ]
+ENTRYPOINT [ "/reverse-proxy-go" ]

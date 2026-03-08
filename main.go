@@ -213,6 +213,9 @@ func main() {
 		log.Println("Debug mode enabled")
 	}
 	if _, err := os.Stat(configFile); errors.Is(err, os.ErrNotExist) {
+		configFile = os.Getenv("CONFIG_FILE")
+	}
+	if _, err := os.Stat(configFile); errors.Is(err, os.ErrNotExist) {
 		fmt.Println("Config not found. Extracting from embedded defaults...")
 
 		if err := extractDefaultConfig(); err != nil {
@@ -842,12 +845,12 @@ func loadConfig() {
 		}
 		return
 	}
-	if err := json.Unmarshal(data, &config); err != nil {
+	if err := json.Unmarshal([]byte(os.ExpandEnv(string(data))), &config); err != nil {
 		log.Fatalf("Failed to parse config: %v", err)
 	}
-	if DEBUG {
-		log.Printf("Loaded config: %+v", config)
-	}
+
+	log.Printf("Loaded config: %+v", config)
+
 	if port != 8080 {
 		config.Port = port
 	}

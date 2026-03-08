@@ -82,9 +82,9 @@ type VHost struct {
 type authMode int
 
 const (
-	authNone  authMode = iota // no authentication
-	authHS256                 // HMAC-SHA256 shared secret
-	authRS256                 // RSA-SHA256 public/private key pair
+	authNone   authMode = iota // no authentication
+	authHS256                  // HMAC-SHA256 shared secret
+	authRS256                  // RSA-SHA256 public/private key pair
 )
 
 // vhostHandler holds the fully-initialised handler for one vhost.
@@ -257,6 +257,7 @@ func main() {
 
 	var wg sync.WaitGroup
 	for _, grp := range groups {
+		grp := grp
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -338,12 +339,25 @@ func (grp *portGroup) route(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Built-in login page — serves before auth so unauthenticated browsers
+	// can reach it. It is only registered when auth is enabled for this vhost.
+	if h.requiresAuth && r.URL.Path == authLoginPath {
+		serveLoginPage(w, r, h.vhost)
+		return
+	}
+
 	// JWT auth (localhost requests bypass auth)
 	if h.requiresAuth && !isLocalhost(remoteIP) {
 		res, err := validateJWT(r, h)
 		if err != nil {
 			log.Printf("JWT [%s]: %v", h.vhost.Hostname, err)
-			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			// API clients (non-browser or explicit token requests) get a plain 401.
+			// Browser requests get a redirect to the built-in login page instead.
+			if isBrowserRequest(r) {
+				redirectToLogin(w, r)
+			} else {
+				http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			}
 			return
 		}
 		// On first auth (token arrived via header / query param, not cookie),
@@ -784,7 +798,7 @@ func validateJWT(r *http.Request, h *vhostHandler) (*jwtResult, error) {
 	parsed, err := jwt.Parse(raw,
 		keyFunc,
 		jwt.WithExpirationRequired(), // "exp" claim is mandatory
-		jwt.WithIssuedAt(),           // reject tokens with future iat
+		jwt.WithIssuedAt(),            // reject tokens with future iat
 	)
 	if err != nil {
 		return nil, err
@@ -832,7 +846,7 @@ func setSessionCookie(w http.ResponseWriter, r *http.Request, res *jwtResult, vh
 		Value:    res.raw,
 		Path:     "/",
 		MaxAge:   int(ttl.Seconds()),
-		HttpOnly: true,                 // not accessible via JS
+		HttpOnly: true,                  // not accessible via JS
 		SameSite: http.SameSiteLaxMode, // sensible CSRF default
 		Secure:   vhost.SSLEnabled,     // Secure flag only when the vhost uses TLS
 	}
@@ -845,6 +859,237 @@ func setSessionCookie(w http.ResponseWriter, r *http.Request, res *jwtResult, vh
 			jwtCookieName, vhost.Hostname, ttl.Round(time.Second), vhost.SSLEnabled)
 	}
 }
+
+
+// -----------------------------------------------------------------------
+// Login page (built-in, served at /__auth)
+// -----------------------------------------------------------------------
+
+const authLoginPath = "/__auth"
+
+// isBrowserRequest returns true when the client is likely a browser —
+// it accepts HTML and is not sending an explicit Authorization header.
+// API clients that carry a Bearer token never see the login page.
+func isBrowserRequest(r *http.Request) bool {
+	if r.Header.Get("Authorization") != "" {
+		return false
+	}
+	accept := r.Header.Get("Accept")
+	return strings.Contains(accept, "text/html") || strings.Contains(accept, "*/*")
+}
+
+// redirectToLogin sends a 302 to the built-in login page, encoding the
+// original URL as a ?next= query parameter so the page can redirect back.
+func redirectToLogin(w http.ResponseWriter, r *http.Request) {
+	next := r.URL.RequestURI()
+	http.Redirect(w, r, authLoginPath+"?next="+url.QueryEscape(next), http.StatusFound)
+}
+
+// serveLoginPage handles GET (show form) and POST (accept token) for /__auth.
+func serveLoginPage(w http.ResponseWriter, r *http.Request, vhost VHost) {
+	next := r.URL.Query().Get("next")
+	if next == "" {
+		next = "/"
+	}
+	// Sanitise the redirect target — only allow same-origin relative paths.
+	if !strings.HasPrefix(next, "/") || strings.HasPrefix(next, "//") {
+		next = "/"
+	}
+
+	switch r.Method {
+	case http.MethodPost:
+		serveLoginPost(w, r, vhost, next)
+	default:
+		serveLoginGet(w, r, next)
+	}
+}
+
+// serveLoginGet renders the token-entry form.
+func serveLoginGet(w http.ResponseWriter, r *http.Request, next string) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(http.StatusUnauthorized)
+	// next is already validated as a safe relative path above.
+	_ = loginPageTmpl(w, next, "")
+}
+
+// serveLoginPost validates the submitted token, sets the session cookie on
+// success, and redirects to next. On failure it re-renders the form with an
+// error message — never a bare 401 so the user can try again.
+func serveLoginPost(w http.ResponseWriter, r *http.Request, vhost VHost, next string) {
+	if err := r.ParseForm(); err != nil {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_ = loginPageTmpl(w, next, "Could not parse form.")
+		return
+	}
+
+	tokenStr := strings.TrimSpace(r.FormValue("token"))
+	if tokenStr == "" {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.WriteHeader(http.StatusUnauthorized)
+		_ = loginPageTmpl(w, next, "Please enter a token.")
+		return
+	}
+
+	// Build a synthetic request so we can reuse validateJWT unchanged.
+	synthReq := r.Clone(r.Context())
+	synthReq.Header.Set("Authorization", "Bearer "+tokenStr)
+
+	// We need a vhostHandler to call validateJWT; build a minimal one.
+	// resolveAuth already ran at startup — we just need the cached pub key.
+	// Find the real handler from the portGroup via the host header.
+	// Simpler: call validateJWT directly with a temporary handler shell that
+	// carries only what the function needs (auth mode + key material).
+	//
+	// Because we cannot cheaply look up the portGroup here, we rely on the
+	// vhost value passed in (which was captured from the real handler above).
+	mode, rsaPub, err := resolveAuth(vhost)
+	if err != nil {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.WriteHeader(http.StatusInternalServerError)
+		_ = loginPageTmpl(w, next, "Server auth configuration error.")
+		return
+	}
+	tmpHandler := &vhostHandler{vhost: vhost, auth: mode, rsaPub: rsaPub, requiresAuth: true}
+
+	res, err := validateJWT(synthReq, tmpHandler)
+	if err != nil {
+		if DEBUG {
+			log.Printf("Login page token rejected for %s: %v", vhost.Hostname, err)
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.WriteHeader(http.StatusUnauthorized)
+		_ = loginPageTmpl(w, next, "Invalid or expired token.")
+		return
+	}
+
+	// Token is good — set the session cookie and redirect.
+	setSessionCookie(w, r, res, vhost)
+	http.Redirect(w, r, next, http.StatusFound)
+}
+
+// loginPageTmpl writes the HTML login form to w and returns any write error.
+// Uses strings.NewReplacer instead of fmt.Fprintf so that the % characters
+// inside the CSS rules (e.g. width:100%) are never misread as format verbs.
+func loginPageTmpl(w http.ResponseWriter, next, errMsg string) error {
+	errHTML := ""
+	if errMsg != "" {
+		errHTML = `<p class="err">` + htmlEscape(errMsg) + `</p>`
+	}
+	replacer := strings.NewReplacer(
+		"{{.Next}}", htmlEscape(next),
+		"{{.Error}}", errHTML,
+	)
+	_, err := replacer.WriteString(w, loginHTML)
+	return err
+}
+
+// htmlEscape escapes the five characters that are significant in HTML/attribute context.
+func htmlEscape(s string) string {
+	s = strings.ReplaceAll(s, "&", "&amp;")
+	s = strings.ReplaceAll(s, "<", "&lt;")
+	s = strings.ReplaceAll(s, ">", "&gt;")
+	s = strings.ReplaceAll(s, `"`, "&#34;")
+	s = strings.ReplaceAll(s, "'", "&#39;")
+	return s
+}
+
+// loginHTML is the self-contained login page template.
+// %s args: next (URL-safe, already escaped), optional error paragraph HTML.
+const loginHTML = `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Authentication required</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0 }
+  body {
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: #0f1117;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    color: #e2e8f0;
+  }
+  .card {
+    background: #1a1d27;
+    border: 1px solid #2d3148;
+    border-radius: 12px;
+    padding: 2.5rem 2rem;
+    width: 100%;
+    max-width: 420px;
+    box-shadow: 0 8px 32px rgba(0,0,0,.4);
+  }
+  .icon {
+    width: 48px; height: 48px;
+    background: linear-gradient(135deg, #6366f1, #8b5cf6);
+    border-radius: 12px;
+    display: flex; align-items: center; justify-content: center;
+    margin-bottom: 1.25rem;
+    font-size: 1.5rem;
+  }
+  h1 { font-size: 1.25rem; font-weight: 600; margin-bottom: .35rem }
+  .sub { font-size: .875rem; color: #94a3b8; margin-bottom: 1.75rem }
+  label { display: block; font-size: .8rem; font-weight: 500;
+          color: #94a3b8; margin-bottom: .4rem; letter-spacing: .03em }
+  textarea {
+    width: 100%; min-height: 120px;
+    background: #0f1117;
+    border: 1px solid #2d3148;
+    border-radius: 8px;
+    color: #e2e8f0;
+    font-family: "SFMono-Regular", Consolas, monospace;
+    font-size: .78rem;
+    line-height: 1.5;
+    padding: .65rem .75rem;
+    resize: vertical;
+    outline: none;
+    transition: border-color .15s;
+  }
+  textarea:focus { border-color: #6366f1 }
+  .err {
+    margin-top: .9rem;
+    background: rgba(239,68,68,.12);
+    border: 1px solid rgba(239,68,68,.35);
+    color: #fca5a5;
+    border-radius: 6px;
+    padding: .55rem .75rem;
+    font-size: .825rem;
+  }
+  button {
+    margin-top: 1.25rem;
+    width: 100%;
+    padding: .7rem;
+    background: linear-gradient(135deg, #6366f1, #8b5cf6);
+    border: none;
+    border-radius: 8px;
+    color: #fff;
+    font-size: .95rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: opacity .15s;
+  }
+  button:hover { opacity: .88 }
+  .hint { margin-top: 1rem; font-size: .775rem; color: #475569; text-align: center }
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="icon">&#128274;</div>
+  <h1>Authentication required</h1>
+  <p class="sub">Paste your JWT token below to continue.</p>
+  <form method="POST" action="/__auth?next={{.Next}}">
+    <label for="token">JWT Token</label>
+    <textarea id="token" name="token" placeholder="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..." autofocus spellcheck="false" autocomplete="off"></textarea>
+    {{.Error}}
+    <button type="submit">Sign in &#8594;</button>
+  </form>
+  <p class="hint">Token is stored as a secure session cookie and expires with the token.</p>
+</div>
+</body>
+</html>`
 
 // -----------------------------------------------------------------------
 // IP helpers

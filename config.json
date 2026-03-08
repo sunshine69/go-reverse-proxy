@@ -31,7 +31,7 @@
       "hostname": "localhost",
       "path_base": "",
       "port": 8080,
-      "static_dir": ".",
+      "static_dir": "public",
       "static_404": "/var/www/docs/404.html",
       "jwt_secret": "",
       "ssl_enabled": true,

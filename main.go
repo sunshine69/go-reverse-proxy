@@ -19,6 +19,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
@@ -379,6 +380,9 @@ func (grp *portGroup) route(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	w.Header().Set("X-Frame-Options", "DENY")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("Referrer-Policy", "same-origin")
 	// Dispatch to static file server or reverse proxy
 	if h.staticFS != nil {
 		h.staticFS.ServeHTTP(w, r)
@@ -603,26 +607,43 @@ func createStaticHandler(vhost VHost) (*vhostHandler, error) {
 		fallback := strings.TrimPrefix(vhost.StaticFallback, "/")
 		inner := fileHandler
 		fileHandler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			// Derive on-disk path from the already-stripped URL.
 			p := strings.TrimPrefix(r.URL.Path, stripPrefix)
 			if !strings.HasPrefix(p, "/") {
 				p = "/" + p
 			}
-			if _, serr := os.Stat(staticDir + p); os.IsNotExist(serr) {
-				http.ServeFile(w, r, staticDir+"/"+fallback)
-				return
-			}
-			inner.ServeHTTP(w, r)
-		})
-	}
 
-	mux := http.NewServeMux()
-	mux.Handle(routePath, fileHandler)
-	h := http.Handler(mux)
+			full := filepath.Join(staticDir, p)
+
+			f, err := os.Open(full)
+			if err == nil {
+				info, _ := f.Stat()
+				f.Close()
+
+				if !info.IsDir() {
+					inner.ServeHTTP(w, r)
+					return
+				}
+			}
+
+			http.ServeFile(w, r, filepath.Join(staticDir, fallback))
+		})
+		// fileHandler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// 	// Derive on-disk path from the already-stripped URL.
+		// 	p := strings.TrimPrefix(r.URL.Path, stripPrefix)
+		// 	if !strings.HasPrefix(p, "/") {
+		// 		p = "/" + p
+		// 	}
+		// 	if _, serr := os.Stat(staticDir + p); os.IsNotExist(serr) {
+		// 		http.ServeFile(w, r, staticDir+"/"+fallback)
+		// 		return
+		// 	}
+		// 	inner.ServeHTTP(w, r)
+		// })
+	}
 
 	return &vhostHandler{
 		vhost:    vhost,
-		staticFS: h,
+		staticFS: http.StripPrefix(stripPrefix, fs),
 		// requiresAuth / auth / rsaPub are set by createVHostHandler
 	}, nil
 }
@@ -671,7 +692,20 @@ func buildTLSConfig(grp *portGroup) (*tls.Config, error) {
 	}
 
 	defaultCert := &certs[0]
+
 	return &tls.Config{
+		MinVersion:               tls.VersionTLS12,
+		PreferServerCipherSuites: true,
+		CurvePreferences: []tls.CurveID{
+			tls.X25519,
+			tls.CurveP256,
+		},
+		CipherSuites: []uint16{
+			tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+			tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+			tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+			tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+		},
 		Certificates: certs,
 		GetCertificate: func(info *tls.ClientHelloInfo) (*tls.Certificate, error) {
 			if info.ServerName != "" {
@@ -682,6 +716,18 @@ func buildTLSConfig(grp *portGroup) (*tls.Config, error) {
 			return defaultCert, nil
 		},
 	}, nil
+
+	// return &tls.Config{
+	// 	Certificates: certs,
+	// 	GetCertificate: func(info *tls.ClientHelloInfo) (*tls.Certificate, error) {
+	// 		if info.ServerName != "" {
+	// 			if c, ok := sniMap[strings.ToLower(info.ServerName)]; ok {
+	// 				return c, nil
+	// 			}
+	// 		}
+	// 		return defaultCert, nil
+	// 	},
+	// }, nil
 }
 
 func generateSelfSignedCert(certFile, keyFile string) (tls.Certificate, error) {
@@ -699,10 +745,10 @@ func generateSelfSignedCert(certFile, keyFile string) (tls.Certificate, error) {
 		Subject:               pkix.Name{Organization: []string{"Self-Signed"}, CommonName: "localhost"},
 		NotBefore:             now,
 		NotAfter:              now.Add(365 * 24 * time.Hour),
-		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
+		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 		BasicConstraintsValid: true,
-		IsCA:                  true,
+		IsCA:                  false,
 		DNSNames:              []string{"localhost"},
 		IPAddresses:           []net.IP{net.ParseIP("127.0.0.1"), net.ParseIP("::1")},
 	}

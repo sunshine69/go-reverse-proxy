@@ -18,7 +18,6 @@
     },
     {
       "hostname": "127.0.0.1",
-      "port": 8081,
       "upstream_url": "http://localhost:11434",
       "jwt_secret": "",
       "ssl_enabled": false,
@@ -30,7 +29,7 @@
     {
       "hostname": "localhost",
       "path_base": "",
-      "port": 8080,
+      "port": 8081,
       "static_dir": "public",
       "static_404": "/var/www/docs/404.html",
       "jwt_secret": "${JWT_SECRET}",
@@ -39,6 +38,5 @@
       "ssl_key": "server.key",
       "custom_headers": {}
     }
-
   ]
 }

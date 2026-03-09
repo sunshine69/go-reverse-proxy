@@ -23,7 +23,10 @@ A flexible reverse proxy server built in Go that supports:
 
 ## 🗂️ Configuration
 
-### ✅ Required: `config.json`
+### ✅ Required: `config.json`.
+
+If not exists the command will extract default embed one to the current dir, you can edit it and re-run.
+
 ```json
 {
   "port": 8080,
@@ -37,10 +40,19 @@ A flexible reverse proxy server built in Go that supports:
       "hostname": "example.com",
       "upstream_url": "https://backend.example.com",
       "jwt_secret": "your-secret-key",
+      "ssl_enabled": true, // for listener
+      "ssl_cert": "cert.pem",
+      "ssl_key": "key.pem",
+      "insecure_tls": false, // for upstream negotiation
+      "custom_headers": {} // Extra header to send to upstream
+    },
+    {
+      "hostname": "example1.com",
+      "static_dir": "public",
+      "jwt_secret": "${JWT_SECRET}", // read from env var
       "ssl_enabled": true,
       "ssl_cert": "cert.pem",
       "ssl_key": "key.pem",
-      "insecure_tls": false
     }
   ]
 }

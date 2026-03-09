@@ -24,7 +24,7 @@
       "ssl_enabled": false,
       "insecure_tls": true,
       "custom_headers": {
-        "Authorization": "Bearer <JWT_TOKEN>"
+        "Authorization": "Bearer ${JWT_TOKEN}"
       }
     },
     {
@@ -33,7 +33,7 @@
       "port": 8080,
       "static_dir": "public",
       "static_404": "/var/www/docs/404.html",
-      "jwt_secret": "",
+      "jwt_secret": "${JWT_SECRET}",
       "ssl_enabled": true,
       "ssl_cert": "server.crt",
       "ssl_key": "server.key",

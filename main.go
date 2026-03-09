@@ -174,7 +174,7 @@ func extractDefaultConfig() error {
 
 	// Find config.json inside the zip
 	for _, file := range zipReader.File {
-		if file.Name == configFile {
+		if file.Name == "config.json" {
 			src, err := file.Open()
 			if err != nil {
 				return err
@@ -182,7 +182,7 @@ func extractDefaultConfig() error {
 			defer src.Close()
 
 			// Create the local file
-			dst, err := os.Create(configFile)
+			dst, err := os.Create("config.json")
 			if err != nil {
 				return err
 			}
@@ -194,7 +194,7 @@ func extractDefaultConfig() error {
 		}
 	}
 
-	return fmt.Errorf("file %s not found in embedded zip", configFile)
+	return fmt.Errorf("file %s not found in embedded zip", "config.json")
 }
 
 // -----------------------------------------------------------------------
@@ -219,7 +219,7 @@ func main() {
 		fmt.Println("Config not found. Extracting from embedded defaults...")
 
 		if err := extractDefaultConfig(); err != nil {
-			fmt.Printf("Failed to extract config: %v\n", err)
+			fmt.Printf("Failed to extract config %s: %v\n", configFile, err)
 			return
 		}
 		fmt.Println("Successfully extracted " + configFile)
@@ -619,8 +619,9 @@ func createProxyHandler(vhost VHost) (*vhostHandler, error) {
 			for k, v := range vhost.CustomeHeaders {
 				preq.Out.Header.Set(k, v)
 			}
-
-			log.Printf("Rewrite [%s] → %s%s", vhost.Hostname, targetURL.Host, preq.Out.URL.Path)
+			if DEBUG {
+				log.Printf("Rewrite [%s] → %s%s", vhost.Hostname, targetURL.Host, preq.Out.URL.Path)
+			}
 		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
 			log.Printf("Proxy error [%s]: %v", vhost.Hostname, err)

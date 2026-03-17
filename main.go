@@ -355,7 +355,7 @@ func runServer(ctx context.Context, grp *portGroup) {
 		// Tight timeouts keep goroutine/buffer pressure low.
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,
-		WriteTimeout:      60 * time.Second,
+		WriteTimeout:      10 * time.Minute,
 		IdleTimeout:       120 * time.Second,
 	}
 
@@ -558,8 +558,11 @@ func createProxyHandler(vhost VHost) (*vhostHandler, error) {
 			Timeout:   30 * time.Second,
 			KeepAlive: 30 * time.Second,
 		}).DialContext,
-		ForceAttemptHTTP2:     true,
-		MaxIdleConns:          100,
+		ForceAttemptHTTP2:     false,
+		MaxIdleConns:          500,
+		MaxIdleConnsPerHost:   200,
+		MaxConnsPerHost:       200,
+		ResponseHeaderTimeout: 5 * time.Minute,
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   10 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
@@ -577,7 +580,8 @@ func createProxyHandler(vhost VHost) (*vhostHandler, error) {
 	//     preventing client IP-spoofing; we reconstruct them explicitly via
 	//     SetXForwarded() and then add our own accurate X-Real-IP.
 	proxy := &httputil.ReverseProxy{
-		Transport: tr,
+		FlushInterval: -1,
+		Transport:     tr,
 		Rewrite: func(preq *httputil.ProxyRequest) {
 			// Point the outbound request at the upstream.
 			preq.SetURL(targetURL)

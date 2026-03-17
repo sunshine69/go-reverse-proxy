@@ -563,9 +563,9 @@ func createProxyHandler(vhost VHost) (*vhostHandler, error) {
 		MaxIdleConnsPerHost:   200,
 		MaxConnsPerHost:       200,
 		ResponseHeaderTimeout: 5 * time.Minute,
-		IdleConnTimeout:       90 * time.Second,
-		TLSHandshakeTimeout:   10 * time.Second,
-		ExpectContinueTimeout: 1 * time.Second,
+		IdleConnTimeout:       180 * time.Second,
+		TLSHandshakeTimeout:   20 * time.Second,
+		ExpectContinueTimeout: 10 * time.Second,
 	}
 	if vhost.InsecureTLS {
 		tr.TLSClientConfig = &tls.Config{InsecureSkipVerify: true} //nolint:gosec

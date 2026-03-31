@@ -60,6 +60,7 @@ type VHost struct {
 
 	// Proxy mode
 	UpstreamURL    string            `json:"upstream_url"`
+	UpstreamHost   string            `json:"upstream_host"`
 	InsecureTLS    bool              `json:"insecure_tls"`
 	CustomeHeaders map[string]string `json:"custom_headers"`
 
@@ -544,6 +545,7 @@ func createVHostHandler(vhost VHost) (*vhostHandler, error) {
 }
 
 func createProxyHandler(vhost VHost) (*vhostHandler, error) {
+	log.Printf("Creating createProxyHandler for VHOST %s => %s\n", vhost.Hostname, vhost.UpstreamURL)
 	if vhost.UpstreamURL == "" {
 		return nil, fmt.Errorf("upstream_url required for proxy mode")
 	}
@@ -567,8 +569,16 @@ func createProxyHandler(vhost VHost) (*vhostHandler, error) {
 		TLSHandshakeTimeout:   20 * time.Second,
 		ExpectContinueTimeout: 10 * time.Second,
 	}
+
+	tr.TLSClientConfig = &tls.Config{}
+
 	if vhost.InsecureTLS {
-		tr.TLSClientConfig = &tls.Config{InsecureSkipVerify: true} //nolint:gosec
+		log.Printf("VHOST %s enable InsecureTLS for upstream %s\n", vhost.Hostname, vhost.UpstreamURL)
+		tr.TLSClientConfig.InsecureSkipVerify = true //nolint:gosec
+	}
+	// Allow to use IP in the Upstream URL but sending hostname
+	if vhost.UpstreamHost != "" {
+		tr.TLSClientConfig.ServerName = vhost.UpstreamHost
 	}
 
 	log.Printf("Proxy from %s => %s\n", vhost.Hostname, vhost.UpstreamURL)
@@ -587,7 +597,12 @@ func createProxyHandler(vhost VHost) (*vhostHandler, error) {
 			preq.SetURL(targetURL)
 			// Rewrite() clears Host; restore it to the upstream host so that
 			// virtual hosting on the upstream side works correctly.
-			preq.Out.Host = targetURL.Host
+			if vhost.UpstreamHost != "" {
+				// log.Printf("Upstream host is set for vhost %s - upstream %s - set to %s\n", vhost.Hostname, vhost.UpstreamURL, vhost.UpstreamHost)
+				preq.Out.Host = vhost.UpstreamHost
+			} else {
+				preq.Out.Host = targetURL.Host
+			}
 
 			// Strip PathBase so the upstream sees a clean "/" root.
 			// (Static mode handles this via StripPrefix instead.)

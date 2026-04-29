@@ -1,4 +1,4 @@
-FROM golang:1.26.1-alpine3.23 AS BUILD_BASE
+FROM golang:1.26.2-alpine3.23 AS BUILD_BASE
 
 RUN mkdir /imagetmp && chmod 1777 /imagetmp
 ADD . /src/
